@@ -235,50 +235,52 @@ func TestClientViaRouting(t *testing.T) {
 	assert.Equal(t, 5060, via.Port)
 }
 
-func TestClientWriteRequestRejectsCRLFAfterBuild(t *testing.T) {
-	ua, err := NewUA()
-	require.NoError(t, err)
+// TestClientRequestCRLFValidation covers the flow the README prescribes. The
+// client itself does not validate, that is left to the caller, so this checks
+// both that a caller catches an injected header and that validation does not
+// reject a request the client has finished building.
+func TestClientRequestCRLFValidation(t *testing.T) {
+	newClient := func(t *testing.T, requested *bool) *Client {
+		ua, err := NewUA()
+		require.NoError(t, err)
 
-	client, err := NewClient(ua, WithClientHostname("127.0.0.1"))
-	require.NoError(t, err)
+		client, err := NewClient(ua, WithClientHostname("127.0.0.1"))
+		require.NoError(t, err)
 
-	called := false
-	client.TxRequester = clientTxRequesterFunc(func(ctx context.Context, req *sip.Request) (sip.ClientTransaction, error) {
-		called = true
-		return nil, nil
+		client.TxRequester = clientTxRequesterFunc(func(ctx context.Context, req *sip.Request) (sip.ClientTransaction, error) {
+			*requested = true
+			return nil, nil
+		})
+		return client
+	}
+
+	t.Run("caller rejects injected header", func(t *testing.T) {
+		requested := false
+		newClient(t, &requested)
+
+		req := sip.NewRequest(sip.REGISTER, sip.Uri{User: "foo", Host: "example.com"})
+		req.AppendHeader(sip.NewHeader("Subject", "injected\r\nContent-Length: 0"))
+
+		require.ErrorIs(t, sip.ValidateRequest(req), sip.ErrInvalidCRLF)
+		require.False(t, requested, "request must not reach the transport")
 	})
 
-	req := sip.NewRequest(sip.REGISTER, sip.Uri{User: "foo", Host: "example.com"})
-	req.AppendHeader(sip.NewHeader("Subject", "injected\r\nContent-Length: 0"))
+	t.Run("client built request validates", func(t *testing.T) {
+		requested := false
+		client := newClient(t, &requested)
 
-	err = client.WriteRequest(req)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "invalid CRLF")
-	require.False(t, called)
-	require.NotNil(t, req.Via())
-}
+		req := sip.NewRequest(sip.REGISTER, sip.Uri{User: "foo", Host: "example.com"})
+		req.AppendHeader(sip.NewHeader("Subject", "hello"))
+		require.NoError(t, sip.ValidateRequest(req))
 
-func TestClientTransactionRequestRejectsCRLFAfterBuild(t *testing.T) {
-	ua, err := NewUA()
-	require.NoError(t, err)
+		require.NoError(t, client.WriteRequest(req))
+		require.True(t, requested)
 
-	client, err := NewClient(ua, WithClientHostname("127.0.0.1"))
-	require.NoError(t, err)
-
-	called := false
-	client.TxRequester = clientTxRequesterFunc(func(ctx context.Context, req *sip.Request) (sip.ClientTransaction, error) {
-		called = true
-		return nil, nil
+		// The client fills in Via, CSeq and friends on its way out. None of
+		// them may trip the validator.
+		require.NotNil(t, req.Via())
+		require.NoError(t, sip.ValidateRequest(req))
 	})
-
-	req := sip.NewRequest(sip.REGISTER, sip.Uri{User: "foo", Host: "example.com"})
-	req.AppendHeader(sip.NewHeader("Subject", "injected\r\nContent-Length: 0"))
-
-	_, err = client.TransactionRequest(context.Background(), req)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "invalid CRLF")
-	require.False(t, called)
-	require.NotNil(t, req.Via())
 }
 
 type clientTxRequesterFunc func(ctx context.Context, req *sip.Request) (sip.ClientTransaction, error)
