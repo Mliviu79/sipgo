@@ -37,7 +37,8 @@ func (tx *ClientTx) Init() error {
 	tx.initFSM()
 
 	if err := tx.conn.WriteMsg(tx.origin); err != nil {
-		e := fmt.Errorf("fail to write request on init req=%q: %w", tx.origin.StartLine(), err)
+		// First write of transaction. It failed, so request never reached wire
+		e := fmt.Errorf("fail to write request on init req=%q: %w: %w", tx.origin.StartLine(), ErrTransactionNotSent, err)
 		return wrapTransportError(e)
 	}
 
