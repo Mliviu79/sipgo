@@ -51,7 +51,39 @@ func (p *connectionPool) init() {
 }
 
 func (p *connectionPool) addSingleflight(raddr Addr, laddr Addr, reuse bool, do func() (Connection, error)) (Connection, error) {
+	return p.addSingleflightWithAliases(raddr, laddr, reuse, nil, do)
+}
+
+// addSingleflightWithAliases is addSingleflight plus extra keys the same
+// connection is registered under.
+//
+// A transport that dials one address form but is addressed by another needs it.
+// WSS dials a registrar by hostname, because TLS verifies the certificate
+// against that name, while the registrar's own SIP traffic carries its IP --
+// and Addr.String() prefers a resolved IP, so the dialled form and the addressed
+// form are routinely different strings for one peer. Registering only the
+// dialled form leaves a lookup by any other form missing a connection that is
+// open and healthy, so an inbound request arriving on that socket cannot be
+// matched back to it.
+//
+// Aliases are additive: they never replace the raddr and local-address keys, and
+// passing none reproduces addSingleflight exactly.
+func (p *connectionPool) addSingleflightWithAliases(raddr Addr, laddr Addr, reuse bool, aliases []string, do func() (Connection, error)) (Connection, error) {
 	a := raddr.String()
+
+	// register records every key this connection answers to. Callers below hold
+	// the lock on the singleflight path and, preserving the existing behaviour of
+	// the unblocked path, do not on the other.
+	register := func(c Connection) {
+		p.m[a] = c
+		p.m[c.LocalAddr().String()] = c
+		for _, alias := range aliases {
+			if alias == "" {
+				continue
+			}
+			p.m[alias] = c
+		}
+	}
 
 	if laddr.Port > 0 || reuse {
 		// TODO: implement singleflight without  type conversion
@@ -79,8 +111,7 @@ func (p *connectionPool) addSingleflight(raddr Addr, laddr Addr, reuse bool, do 
 			p.Lock()
 			defer p.Unlock()
 
-			p.m[a] = c
-			p.m[c.LocalAddr().String()] = c
+			register(c)
 			return c, nil
 		})
 		if err != nil {
@@ -100,8 +131,7 @@ func (p *connectionPool) addSingleflight(raddr Addr, laddr Addr, reuse bool, do 
 	if c.Ref(0) < 1 {
 		c.Ref(1) // Make 1 reference count by default
 	}
-	p.m[a] = c
-	p.m[c.LocalAddr().String()] = c
+	register(c)
 	return c, nil
 }
 

@@ -44,6 +44,50 @@ func (t *TransportWSS) String() string {
 	return "transport<WSS>"
 }
 
+// wsConnectionAliases returns the address forms a WebSocket connection to raddr
+// must also be findable under, beyond the one the pool derives from raddr itself.
+//
+// A WebSocket to a registrar is dialled by hostname, because TLS verifies the
+// certificate against that name, but the registrar identifies itself by IP in
+// the SIP traffic it sends back -- and Addr.String() prefers a resolved IP, so
+// the dialled form and the addressed form are routinely different strings for
+// the same peer. Either form may also appear with or without the port, depending
+// on the header a lookup is driven from.
+//
+// Registering every form is what keeps a lookup by any of them resolving to the
+// one socket that is actually open. It matters more here than on other
+// transports because a WS client is never reachable at its contact address: the
+// connection it opened is the only path back to it, so failing to match it is
+// not a slow path, it is an undeliverable request.
+//
+// Duplicates are dropped, so a peer with no hostname -- or one whose hostname is
+// its IP -- does not register the same key twice.
+func wsConnectionAliases(raddr Addr) []string {
+	var out []string
+	add := func(s string) {
+		if s == "" {
+			return
+		}
+		for _, existing := range out {
+			if existing == s {
+				return
+			}
+		}
+		out = append(out, s)
+	}
+
+	port := strconv.Itoa(raddr.Port)
+	if raddr.IP != nil {
+		add(net.JoinHostPort(raddr.IP.String(), port))
+		add(raddr.IP.String())
+	}
+	if raddr.Hostname != "" {
+		add(net.JoinHostPort(raddr.Hostname, port))
+		add(raddr.Hostname)
+	}
+	return out
+}
+
 // CreateConnection creates WSS connection for TCP transport
 // TODO Make this consisten with TCP
 func (t *TransportWSS) CreateConnection(ctx context.Context, laddr Addr, raddr Addr, handler MessageHandler) (Connection, error) {
@@ -54,7 +98,15 @@ func (t *TransportWSS) CreateConnection(ctx context.Context, laddr Addr, raddr A
 		return nil, fmt.Errorf("remote address IP not resolved")
 	}
 
-	conn, err := t.pool.addSingleflight(laddr, raddr, t.connectionReuse, func() (Connection, error) {
+	// raddr first. The pool keys on its first argument, so passing laddr there
+	// registered this socket under our own local address -- twice, since the pool
+	// also keys the local address -- and under the registrar's address never,
+	// leaving every lookup the far end drives with no connection to find. UDP, TCP
+	// and WS all pass this order; WSS alone had it reversed.
+	//
+	// The aliases cover the address forms other than the dialled one; see
+	// wsConnectionAliases.
+	conn, err := t.pool.addSingleflightWithAliases(raddr, laddr, t.connectionReuse, wsConnectionAliases(raddr), func() (Connection, error) {
 		// We need to distict IPAddr vs address with hostname
 		// Hostname must be passed for TLS if provided due to certificates check
 		hostname := raddr.Hostname
