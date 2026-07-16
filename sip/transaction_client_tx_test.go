@@ -129,3 +129,24 @@ func TestClientTransactionFSM(t *testing.T) {
 		require.NoError(t, compareFunctions(tx.currentFsmState(), tx.inviteStateAccepted))
 	})
 }
+
+func TestClientTransactionInitNotSent(t *testing.T) {
+	req, _, _ := testCreateInvite(t, "sip:127.0.0.99:5060", "udp", "127.0.0.2:5060")
+	req.raddr = Addr{IP: net.ParseIP("127.0.0.99"), Port: 5060}
+
+	// No writer registered for the destination, so the transaction's first write fails
+	conn := &UDPConnection{
+		PacketConn: &fakes.UDPConn{
+			Reader:  bytes.NewBuffer([]byte{}),
+			Writers: map[string]io.Writer{},
+		},
+	}
+	tx := NewClientTx("123", req, conn, slog.Default())
+
+	err := tx.Init()
+	require.Error(t, err)
+	// Nothing left the socket, so caller can act on the request as never sent
+	require.ErrorIs(t, err, ErrTransactionNotSent)
+	// Existing callers matching the transport error keep working
+	require.ErrorIs(t, err, ErrTransactionTransport)
+}

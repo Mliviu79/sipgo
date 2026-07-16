@@ -77,10 +77,16 @@ var (
 	ErrTransactionTransport  = errors.New("transaction transport error")
 	ErrTransactionCanceled   = errors.New("transaction canceled")
 	ErrTransactionTerminated = errors.New("transaction terminated")
+	// ErrTransactionNotSent narrows ErrTransactionTransport to a failed first write,
+	// where request never reached wire. Other transport errors, like failed ACK or
+	// retransmission, happen after request is already sent.
+	ErrTransactionNotSent = errors.New("transaction request not sent")
 )
 
+// wrapTransportError wraps cause with %w to keep it matchable. errors.Is on
+// ErrTransactionTransport is unaffected.
 func wrapTransportError(err error) error {
-	return fmt.Errorf("%s. %w", err.Error(), ErrTransactionTransport)
+	return fmt.Errorf("%w. %w", err, ErrTransactionTransport)
 }
 
 func wrapTimeoutError(err error) error {
