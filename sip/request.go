@@ -250,7 +250,7 @@ func newAckRequestNon2xx(inviteRequest *Request, inviteResponse *Response, body 
 	// header fields, those header fields MUST appear in the ACK to non-2xx response.
 	if len(inviteRequest.GetHeaders("Route")) > 0 {
 		CopyHeaders("Route", inviteRequest, ackRequest)
-	} 
+	}
 
 	maxForwardsHeader := MaxForwardsHeader(70)
 	ackRequest.AppendHeader(&maxForwardsHeader)

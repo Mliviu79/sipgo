@@ -4,8 +4,6 @@ type fsmInput int
 type fsmState func() fsmInput
 type fsmContextState func(s fsmInput) fsmInput
 
-const ()
-
 // FSM Inputs
 const (
 	FsmInputNone fsmInput = iota

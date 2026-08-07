@@ -7,8 +7,6 @@ import (
 	"strings"
 )
 
-const ()
-
 // Header is a single SIP header.
 type Header interface {
 	// Name returns underlying header name.

@@ -7,8 +7,6 @@ import (
 	"net"
 )
 
-var ()
-
 // TLS transport implementation
 type TransportTLS struct {
 	*TransportTCP
