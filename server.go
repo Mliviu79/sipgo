@@ -358,6 +358,23 @@ func (srv *Server) RegisteredMethods() []string {
 	return r
 }
 
+// Handler returns the request handler currently registered for method, or nil
+// when no handler is registered for it.
+//
+// Registration is last write wins: OnRequest and every OnXxx registrar assign
+// straight into the handler map, so a package that registers a handler for a
+// method another package has already claimed destroys the incumbent silently.
+// Reading the incumbent back is what lets the second registrar compose with it
+// instead of replacing it.
+//
+// A nil return means nobody registered a handler. The fallback used for
+// unrouted methods is deliberately not substituted: the question this answers
+// is whether a handler exists, and handing back the fallback would let a
+// composition wrap the 405 responder without noticing.
+func (srv *Server) Handler(method sip.RequestMethod) RequestHandler {
+	return srv.requestHandlers[method]
+}
+
 func (srv *Server) getHandler(method sip.RequestMethod) (handler RequestHandler) {
 	handler, ok := srv.requestHandlers[method]
 	if !ok {

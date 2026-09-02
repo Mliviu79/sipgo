@@ -407,3 +407,49 @@ func ExampleServer_OnNoRoute() {
 		}
 	})
 }
+
+func TestServerHandler(t *testing.T) {
+	newServer := func(t *testing.T) *Server {
+		t.Helper()
+		ua, err := NewUA()
+		require.Nil(t, err)
+		srv, err := NewServer(ua)
+		require.Nil(t, err)
+		t.Cleanup(func() { srv.Close() })
+		return srv
+	}
+
+	t.Run("registered method returns the handler that was registered", func(t *testing.T) {
+		srv := newServer(t)
+		calls := 0
+		srv.OnNotify(func(req *sip.Request, tx sip.ServerTransaction) { calls++ })
+
+		handler := srv.Handler(sip.NOTIFY)
+		require.NotNil(t, handler)
+
+		handler(nil, nil)
+		assert.Equal(t, 1, calls, "the returned handler must be the registered function")
+	})
+
+	t.Run("unregistered method returns nil, not the no route fallback", func(t *testing.T) {
+		srv := newServer(t)
+
+		assert.Nil(t, srv.Handler(sip.NOTIFY),
+			"a caller asking whether anybody registered a handler must not be handed the fallback")
+	})
+
+	t.Run("registering twice returns the second handler", func(t *testing.T) {
+		srv := newServer(t)
+		srv.OnNotify(func(req *sip.Request, tx sip.ServerTransaction) {
+			t.Error("the overwritten handler must not be reachable")
+		})
+		secondCalls := 0
+		srv.OnNotify(func(req *sip.Request, tx sip.ServerTransaction) { secondCalls++ })
+
+		handler := srv.Handler(sip.NOTIFY)
+		require.NotNil(t, handler)
+
+		handler(nil, nil)
+		assert.Equal(t, 1, secondCalls, "registration is last write wins, which is what composition depends on")
+	})
+}
