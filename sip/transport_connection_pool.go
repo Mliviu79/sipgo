@@ -38,7 +38,18 @@ type connectionPool struct {
 	sync.RWMutex
 	m  map[string]Connection
 	sf singleflight.Group
+
+	// closed is set by Clear, which runs when the owning transport is closed.
+	// A connection created after that point is never reaped: nothing clears
+	// this pool a second time, so its reader goroutine stays parked on an open
+	// socket for the life of the process. A transaction still retransmitting
+	// when the transport closes reaches exactly that path.
+	closed bool
 }
+
+// errPoolClosed is returned when a connection is requested from a pool whose
+// transport has already been closed.
+var errPoolClosed = errors.New("connection pool is closed")
 
 func newConnectionPool() *connectionPool {
 	p := &connectionPool{}
@@ -69,6 +80,13 @@ func (p *connectionPool) addSingleflight(raddr Addr, laddr Addr, reuse bool, do 
 // Aliases are additive: they never replace the raddr and local-address keys, and
 // passing none reproduces addSingleflight exactly.
 func (p *connectionPool) addSingleflightWithAliases(raddr Addr, laddr Addr, reuse bool, aliases []string, do func() (Connection, error)) (Connection, error) {
+	p.RLock()
+	closed := p.closed
+	p.RUnlock()
+	if closed {
+		return nil, errPoolClosed
+	}
+
 	a := raddr.String()
 
 	// register records every key this connection answers to. Callers below hold
@@ -111,6 +129,10 @@ func (p *connectionPool) addSingleflightWithAliases(raddr Addr, laddr Addr, reus
 			p.Lock()
 			defer p.Unlock()
 
+			if p.closed {
+				// Cleared while this connection was being dialled.
+				return nil, errors.Join(errPoolClosed, c.Close())
+			}
 			register(c)
 			return c, nil
 		})
@@ -126,6 +148,14 @@ func (p *connectionPool) addSingleflightWithAliases(raddr Addr, laddr Addr, reus
 	c, err := do()
 	if err != nil {
 		return nil, err
+	}
+
+	p.Lock()
+	defer p.Unlock()
+
+	if p.closed {
+		// Cleared while this connection was being dialled.
+		return nil, errors.Join(errPoolClosed, c.Close())
 	}
 
 	if c.Ref(0) < 1 {
@@ -204,6 +234,8 @@ func (p *connectionPool) DeleteMultiple(addrs []string) {
 func (p *connectionPool) Clear() error {
 	p.Lock()
 	defer p.Unlock()
+
+	p.closed = true
 
 	defer func() {
 		// Remove all
