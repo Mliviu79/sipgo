@@ -89,9 +89,8 @@ func (p *connectionPool) addSingleflightWithAliases(raddr Addr, laddr Addr, reus
 
 	a := raddr.String()
 
-	// register records every key this connection answers to. Callers below hold
-	// the lock on the singleflight path and, preserving the existing behaviour of
-	// the unblocked path, do not on the other.
+	// register records every key this connection answers to. Both paths below
+	// call it with p.Lock held.
 	register := func(c Connection) {
 		p.m[a] = c
 		p.m[c.LocalAddr().String()] = c
