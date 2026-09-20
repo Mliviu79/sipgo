@@ -235,10 +235,38 @@ func (txl *TransactionLayer) serverTxRequest(req *Request, key string) error {
 		}
 		return nil
 	}
+	txl.serverTransactions.unlock()
 
-	tx, err := txl.serverTxCreate(req, key)
+	// Connections are singleflight operations
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := txl.tpl.serverRequestConnection(ctx, req)
 	if err != nil {
+		return fmt.Errorf("server tx get connection failed: %w", err)
+	}
+	if conn == nil {
+		return fmt.Errorf("transport returned nil connection")
+	}
+
+	txl.serverTransactions.lock()
+	tx, exists = txl.serverTransactions.items[key]
+	if exists {
 		txl.serverTransactions.unlock()
+		conn.TryClose()
+
+		if err := tx.Receive(req); err != nil {
+			return fmt.Errorf("failed to receive req: %w", err)
+		}
+		return nil
+	}
+
+	tx = NewServerTx(key, req, conn, txl.log)
+	if err := tx.Init(); err != nil {
+		txl.serverTransactions.unlock()
+		// Init failed: this tx never reaches delete(), so release the connection
+		// reference serverRequestConnection took here (mirrors the conn.TryClose
+		// the client path does when it discards a transaction).
+		conn.TryClose()
 		return err
 	}
 
