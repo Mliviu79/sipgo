@@ -164,7 +164,7 @@ func (t *TransportWSS) CreateConnection(ctx context.Context, laddr Addr, raddr A
 			return nil, fmt.Errorf("failed to upgrade: %w", err)
 		}
 
-		c := newWSConnection(tlsConn, true, 2+TransportIdleConnection)
+		c := t.newConnection(tlsConn, 2+TransportIdleConnection, true)
 		go t.readConnection(c, c.LocalAddr().String(), c.RemoteAddr().String(), handler)
 		go c.keepalive(t.log)
 		return c, nil

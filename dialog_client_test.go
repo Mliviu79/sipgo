@@ -333,6 +333,62 @@ func TestDialogClientMultiResponses(t *testing.T) {
 		require.ErrorIs(t, err, ErrAuthMissingCreds)
 	})
 
+	t.Run("ProxyAuthRechallenge", func(t *testing.T) {
+		attempts := 0
+		client := testClient(t, func(req *sip.Request) *sip.Response {
+			attempts++
+			if attempts == 3 {
+				return sip.NewResponseFromRequest(req, 200, "OK", nil)
+			}
+
+			res := sip.NewResponseFromRequest(req, 407, "Proxy Authentication Required", nil)
+			nonce, stale := "first", ""
+			if attempts == 2 {
+				nonce, stale = "second", `, stale=true`
+			}
+			challenge := `Digest realm="test", nonce="` + nonce + `", algorithm=MD5` + stale
+			res.AppendHeader(sip.NewHeader("Proxy-Authenticate", challenge))
+			return res
+		})
+
+		dua := DialogUA{Client: client}
+		d, err := dua.Invite(context.TODO(), sip.Uri{User: "test", Host: "localhost"}, nil)
+		require.NoError(t, err)
+		require.NoError(t, d.WaitAnswer(context.TODO(), AnswerOptions{Username: "user", Password: "secret"}))
+		assert.Equal(t, 3, attempts)
+		auth := d.InviteRequest.GetHeaders("Proxy-Authorization")
+		require.Len(t, auth, 1)
+		assert.Contains(t, auth[0].Value(), `nonce="second"`)
+	})
+
+	t.Run("AuthRechallenge", func(t *testing.T) {
+		attempts := 0
+		client := testClient(t, func(req *sip.Request) *sip.Response {
+			attempts++
+			if attempts == 3 {
+				return sip.NewResponseFromRequest(req, 200, "OK", nil)
+			}
+
+			res := sip.NewResponseFromRequest(req, 401, "Unauthorized", nil)
+			nonce, stale := "first", ""
+			if attempts == 2 {
+				nonce, stale = "second", `, stale=true`
+			}
+			challenge := `Digest realm="test", nonce="` + nonce + `", algorithm=MD5` + stale
+			res.AppendHeader(sip.NewHeader("WWW-Authenticate", challenge))
+			return res
+		})
+
+		dua := DialogUA{Client: client}
+		d, err := dua.Invite(context.TODO(), sip.Uri{User: "test", Host: "localhost"}, nil)
+		require.NoError(t, err)
+		require.NoError(t, d.WaitAnswer(context.TODO(), AnswerOptions{Username: "user", Password: "secret"}))
+		assert.Equal(t, 3, attempts)
+		auth := d.InviteRequest.GetHeaders("Authorization")
+		require.Len(t, auth, 1)
+		assert.Contains(t, auth[0].Value(), `nonce="second"`)
+	})
+
 	// A 401 with no WWW-Authenticate is a plain rejection, not a challenge. It
 	// must reach the caller as its real response, not as a digest parse error.
 	t.Run("AuthNoChallenge", func(t *testing.T) {

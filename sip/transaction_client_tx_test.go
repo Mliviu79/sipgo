@@ -2,6 +2,7 @@ package sip
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -149,4 +150,14 @@ func TestClientTransactionInitNotSent(t *testing.T) {
 	require.ErrorIs(t, err, ErrTransactionNotSent)
 	// Existing callers matching the transport error keep working
 	require.ErrorIs(t, err, ErrTransactionTransport)
+}
+
+func TestWrapTransportErrorPreservesCause(t *testing.T) {
+	cause := errors.New("write: connection refused")
+	err := wrapTransportError(cause)
+
+	// Existing callers matching the transport error keep working
+	require.ErrorIs(t, err, ErrTransactionTransport)
+	// and the cause is now reachable instead of being flattened into the message
+	require.ErrorIs(t, err, cause)
 }

@@ -48,6 +48,15 @@ type TransportTCP struct {
 	onConnClose func(conn Connection)
 }
 
+func (t *TransportTCP) newConnection(conn net.Conn, refcount int) *TCPConnection {
+	return &TCPConnection{
+		Conn:         conn,
+		readTimeout:  t.ReadTimeout,
+		writeTimeout: t.WriteTimeout,
+		refcount:     refcount,
+	}
+}
+
 func (t *TransportTCP) init(par *Parser) {
 	t.parser = par
 	t.pool = newConnectionPool()
@@ -137,11 +146,7 @@ func (t *TransportTCP) CreateConnection(ctx context.Context, laddr Addr, raddr A
 		// }
 
 		t.log.Debug("New connection", "raddr", raddr)
-		c := &TCPConnection{
-			Conn:         conn,
-			writeTimeout: t.WriteTimeout,
-			refcount:     2 + TransportIdleConnection, // 1 returning + 1 reading + Idle
-		}
+		c := t.newConnection(conn, 2+TransportIdleConnection) // 1 returning + 1 reading + Idle
 
 		go t.readConnection(c, c.LocalAddr().String(), c.RemoteAddr().String(), handler)
 		return c, nil
@@ -159,11 +164,7 @@ func (t *TransportTCP) initConnection(conn net.Conn, raddr string, handler Messa
 	// conn.SetKeepAlivePeriod(3 * time.Second)
 	laddr := conn.LocalAddr().String()
 	t.log.Debug("New connection", "raddr", raddr)
-	c := &TCPConnection{
-		Conn:         conn,
-		writeTimeout: t.WriteTimeout,
-		refcount:     1 + TransportIdleConnection,
-	}
+	c := t.newConnection(conn, 1+TransportIdleConnection)
 	t.pool.Add(laddr, c)
 	t.pool.Add(raddr, c)
 	go t.readConnection(c, laddr, raddr, handler)
@@ -189,6 +190,8 @@ func (t *TransportTCP) readConnection(conn *TCPConnection, laddr string, raddr s
 	par := t.parser.NewSIPStream()
 
 	for {
+		// Armed here as well as in TCPConnection.Read so that the transport's
+		// ReadTimeout also bounds a TCPConnection not built by newConnection.
 		if d := t.ReadTimeout; d > 0 {
 			if err := conn.SetReadDeadline(time.Now().Add(d)); err != nil {
 				t.log.Debug("failed to arm read deadline", "error", err)
@@ -293,8 +296,10 @@ func (t *TransportTCP) parseStream(par *ParserStream, data []byte, src string, h
 type TCPConnection struct {
 	net.Conn
 
-	// writeTimeout is copied from the transport at construction and never
-	// changes for the life of the connection. Zero means no write deadline.
+	// readTimeout and writeTimeout are copied from the transport at
+	// construction and never change for the life of the connection. Zero means
+	// no deadline. TCPConnection.Read and Write arm them per call.
+	readTimeout  time.Duration
 	writeTimeout time.Duration
 
 	mu       sync.RWMutex
@@ -338,6 +343,12 @@ func (c *TCPConnection) TryClose() (int, error) {
 }
 
 func (c *TCPConnection) Read(b []byte) (n int, err error) {
+	if c.readTimeout > 0 {
+		if err := c.Conn.SetReadDeadline(time.Now().Add(c.readTimeout)); err != nil {
+			return 0, err
+		}
+	}
+
 	// Some debug hook. TODO move to proper way
 	n, err = c.Conn.Read(b)
 	if SIPDebug {
@@ -353,6 +364,7 @@ func (c *TCPConnection) Write(b []byte) (n int, err error) {
 			return 0, err
 		}
 	}
+
 	// Some debug hook. TODO move to proper way
 	n, err = c.Conn.Write(b)
 	if SIPDebug {

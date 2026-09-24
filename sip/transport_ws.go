@@ -36,6 +36,16 @@ type TransportWS struct {
 	transport  string
 	readFilter TransportReadFilter
 
+	// ReadTimeout limits how long a WS or WSS connection may block waiting for
+	// a frame. It is copied when the connection is created. A non-positive
+	// value disables the timeout.
+	ReadTimeout time.Duration
+
+	// WriteTimeout limits how long a WS or WSS connection may block writing a
+	// frame. It is copied when the connection is created. A non-positive value
+	// disables the timeout.
+	WriteTimeout time.Duration
+
 	connectionReuse bool
 
 	pool   *connectionPool
@@ -48,6 +58,13 @@ type TransportWS struct {
 	DialURI func(host string) string
 
 	onConnClose func(conn Connection)
+}
+
+func (t *TransportWS) newConnection(conn net.Conn, refcount int, clientSide bool) *WSConnection {
+	c := newWSConnection(conn, clientSide, refcount)
+	c.readTimeout = t.ReadTimeout
+	c.writeTimeout = t.WriteTimeout
+	return c
 }
 
 func newWSTransport(par *Parser) *TransportWS {
@@ -164,7 +181,7 @@ func (t *TransportWS) initConnection(conn net.Conn, raddr string, clientSide boo
 	// conn.SetKeepAlivePeriod(3 * time.Second)
 	laddr := conn.LocalAddr().String()
 	t.log.Debug("New WS connection", "raddr", raddr)
-	c := newWSConnection(conn, clientSide, 1+TransportIdleConnection)
+	c := t.newConnection(conn, 1+TransportIdleConnection, clientSide)
 	t.pool.Add(laddr, c)
 	t.pool.Add(raddr, c)
 	go t.readConnection(c, laddr, raddr, handler)
@@ -304,7 +321,7 @@ func (t *TransportWS) CreateConnection(ctx context.Context, laddr Addr, raddr Ad
 		}
 
 		t.log.Debug("New WS connection", "raddr", raddr)
-		c := newWSConnection(conn, true, 2+TransportIdleConnection)
+		c := t.newConnection(conn, 2+TransportIdleConnection, true)
 		go t.readConnection(c, c.LocalAddr().String(), c.RemoteAddr().String(), handler)
 		go c.keepalive(t.log)
 		return c, nil
@@ -319,9 +336,12 @@ func (t *TransportWS) CreateConnection(ctx context.Context, laddr Addr, raddr Ad
 type WSConnection struct {
 	net.Conn
 
-	clientSide bool
-	mu         sync.RWMutex
-	refcount   int
+	clientSide   bool
+	readTimeout  time.Duration
+	writeTimeout time.Duration
+
+	mu       sync.RWMutex
+	refcount int
 
 	// writeMu serializes frame writes on Conn. ws frame writing is not safe for
 	// concurrent use on a single net.Conn, and pings from the keepalive
@@ -453,6 +473,12 @@ func (c *WSConnection) handleControlFrame(header ws.Header, reader io.Reader, st
 }
 
 func (c *WSConnection) Read(b []byte) (n int, err error) {
+	if c.readTimeout > 0 {
+		if err := c.Conn.SetReadDeadline(time.Now().Add(c.readTimeout)); err != nil {
+			return 0, err
+		}
+	}
+
 	state := c.state()
 	reader := wsutil.NewReader(c.Conn, state)
 	reader.MaxFrameSize = int64(ParseMaxMessageLength)
@@ -525,6 +551,12 @@ func (c *WSConnection) Read(b []byte) (n int, err error) {
 }
 
 func (c *WSConnection) Write(b []byte) (n int, err error) {
+	if c.writeTimeout > 0 {
+		if err := c.Conn.SetWriteDeadline(time.Now().Add(c.writeTimeout)); err != nil {
+			return 0, err
+		}
+	}
+
 	if SIPDebug {
 		logSIPWrite("WS", c.Conn.LocalAddr().String(), c.Conn.RemoteAddr().String(), b)
 	}

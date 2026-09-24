@@ -83,8 +83,8 @@ var (
 	ErrTransactionNotSent = errors.New("transaction request not sent")
 )
 
-// wrapTransportError wraps cause with %w to keep it matchable. errors.Is on
-// ErrTransactionTransport is unaffected.
+// wrapTransportError wraps the cause with %w so it stays reachable through
+// errors.Is and errors.As. Matching on ErrTransactionTransport is unaffected.
 func wrapTransportError(err error) error {
 	return fmt.Errorf("%w. %w", err, ErrTransactionTransport)
 }
