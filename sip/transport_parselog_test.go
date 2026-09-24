@@ -46,6 +46,19 @@ func (h *logCapture) find(t *testing.T, msg string) slog.Record {
 	return slog.Record{}
 }
 
+// count reports how many records carrying msg have been captured so far.
+func (h *logCapture) count(msg string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, r := range h.records {
+		if r.Message == msg {
+			n++
+		}
+	}
+	return n
+}
+
 // flatten renders the message and every attribute of a record, so an assertion
 // can cover all fields at once rather than the ones it thought to name.
 func flatten(r slog.Record) string {

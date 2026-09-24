@@ -155,9 +155,20 @@ func (tx *ServerTx) Acks() <-chan *Request {
 	return tx.acks
 }
 
-func (tx *ServerTx) ackSend(r *Request) {
+// ackSend offers r on Acks() until a reader takes it or the transaction ends.
+//
+// An absorbed ACK belongs to a non-2xx final response, which the transaction
+// has already consumed (RFC 3261 17.2.1). It is offered to a TU that waits for
+// it, as DialogServerSession.WriteResponse does, and dropped without a record
+// when the transaction ends first. An ACK that is not absorbed was passed up
+// from the Accepted state (RFC 6026 7.1) for the TU to read, so the transaction
+// ending first is recorded as a missed ACK.
+func (tx *ServerTx) ackSend(r *Request, absorbed bool) {
 	select {
 	case <-tx.done:
+		if absorbed {
+			return
+		}
 		callID := ""
 		if h := r.CallID(); h != nil {
 			callID = h.Value()
@@ -167,7 +178,10 @@ func (tx *ServerTx) ackSend(r *Request) {
 	}
 }
 
-func (tx *ServerTx) ackSendAsync(r *Request) {
+// ackSendAsync hands r to a reader already waiting on Acks(), or otherwise
+// offers it from a goroutine through ackSend, with the same meaning of
+// absorbed.
+func (tx *ServerTx) ackSendAsync(r *Request, absorbed bool) {
 	select {
 	case tx.acks <- r:
 		return
@@ -175,7 +189,7 @@ func (tx *ServerTx) ackSendAsync(r *Request) {
 	}
 
 	// Go routines should be cheap and it will prevent blocking
-	go tx.ackSend(r)
+	go tx.ackSend(r, absorbed)
 }
 
 func (tx *ServerTx) Terminate() {

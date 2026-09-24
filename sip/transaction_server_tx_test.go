@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/emiago/sipgo/fakes"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -171,8 +172,149 @@ func TestServerTransactionAckSendMissingCallID(t *testing.T) {
 	close(tx.done)
 
 	require.NotPanics(t, func() {
-		tx.ackSend(ack)
+		tx.ackSend(ack, false)
 	})
+}
+
+// newTestInviteServerTx builds an initialised INVITE server transaction over a
+// fake UDP connection, logging to the returned capture. Timer I is set on the
+// transaction itself, so no package-level timer is changed.
+func newTestInviteServerTx(t *testing.T, timerI time.Duration) (*ServerTx, *Request, *logCapture) {
+	t.Helper()
+	req, _, _ := testCreateInvite(t, "sip:127.0.0.99:5060", "udp", "127.0.0.2:5060")
+	conn := &UDPConnection{
+		PacketConn: &fakes.UDPConn{
+			Reader:  bytes.NewBuffer([]byte{}),
+			Writers: map[string]io.Writer{"127.0.0.2:5060": bytes.NewBuffer([]byte{})},
+		},
+	}
+	capture := &logCapture{}
+	tx := NewServerTx("123", req, conn, slog.New(capture))
+	require.NoError(t, tx.Init())
+	tx.mu.Lock()
+	tx.timer_i_time = timerI
+	tx.mu.Unlock()
+	t.Cleanup(tx.Terminate)
+	return tx, req, capture
+}
+
+// newTestAck builds the ACK a UAC sends on the branch of req.
+func newTestAck(req *Request) *Request {
+	ack := NewRequest(ACK, req.Recipient)
+	ack.AppendHeader(HeaderClone(req.Via()))
+	ack.AppendHeader(HeaderClone(req.From()))
+	ack.AppendHeader(HeaderClone(req.To()))
+	ack.AppendHeader(HeaderClone(req.CallID()))
+	return ack
+}
+
+// TestServerTransactionAbsorbsNonSuccessAck proves that the ACK for a non-2xx
+// final response, which the transaction consumes itself (RFC 3261 17.2.1),
+// moves it to Confirmed and is never recorded as missed, including after Timer
+// I ends the transaction with nobody reading Acks().
+func TestServerTransactionAbsorbsNonSuccessAck(t *testing.T) {
+	tests := []struct {
+		name     string
+		complete func(t *testing.T, tx *ServerTx, req *Request)
+	}{
+		{
+			name: "486 answer",
+			complete: func(t *testing.T, tx *ServerTx, req *Request) {
+				require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusBusyHere, "Busy Here", nil)))
+			},
+		},
+		{
+			name: "487 after CANCEL",
+			complete: func(t *testing.T, tx *ServerTx, req *Request) {
+				require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusTrying, "Trying", nil)))
+				cancelReq := NewRequest(CANCEL, req.Recipient)
+				cancelReq.AppendHeader(HeaderClone(req.Via()))
+				cancelReq.AppendHeader(HeaderClone(req.From()))
+				cancelReq.AppendHeader(HeaderClone(req.To()))
+				cancelReq.AppendHeader(HeaderClone(req.CallID()))
+				require.NoError(t, tx.Receive(cancelReq))
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tx, req, capture := newTestInviteServerTx(t, 200*time.Millisecond)
+			tc.complete(t, tx, req)
+			require.NoError(t, compareFunctions(tx.currentFsmState(), tx.inviteStateCompleted))
+
+			require.NoError(t, tx.Receive(newTestAck(req)))
+			require.NoError(t, compareFunctions(tx.currentFsmState(), tx.inviteStateConfirmed))
+
+			select {
+			case <-tx.Done():
+			case <-time.After(2 * time.Second):
+				t.Fatal("transaction did not end on Timer I")
+			}
+			assert.Never(t, func() bool { return capture.count("ACK missed") > 0 }, 300*time.Millisecond, 10*time.Millisecond,
+				"the absorbed ACK was recorded as missed")
+		})
+	}
+}
+
+// TestServerTransactionOffersAbsorbedAckToWaitingReader proves that the ACK for
+// a non-2xx final response still reaches a TU that starts reading Acks() after
+// the ACK arrived, which DialogServerSession.WriteResponse relies on.
+func TestServerTransactionOffersAbsorbedAckToWaitingReader(t *testing.T) {
+	tx, req, _ := newTestInviteServerTx(t, 10*time.Second)
+	require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusBusyHere, "Busy Here", nil)))
+
+	ack := newTestAck(req)
+	require.NoError(t, tx.Receive(ack))
+
+	select {
+	case got := <-tx.Acks():
+		require.Same(t, ack, got)
+	case <-time.After(time.Second):
+		t.Fatal("the ACK was not offered on Acks()")
+	}
+}
+
+// TestServerTransactionPassesUpSuccessAck proves that an ACK received in the
+// Accepted state is passed up to a reader of Acks() (RFC 6026 7.1).
+func TestServerTransactionPassesUpSuccessAck(t *testing.T) {
+	tx, req, _ := newTestInviteServerTx(t, 10*time.Second)
+	require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusOK, "OK", nil)))
+	require.NoError(t, compareFunctions(tx.currentFsmState(), tx.inviteStateAccepted))
+
+	ack := newTestAck(req)
+	require.NoError(t, tx.Receive(ack))
+
+	select {
+	case got := <-tx.Acks():
+		require.Same(t, ack, got)
+	case <-time.After(time.Second):
+		t.Fatal("the ACK was not passed up on Acks()")
+	}
+}
+
+// TestServerTransactionWarnsWhenSuccessAckUnread proves that an ACK passed up in
+// the Accepted state, which the TU is expected to read, is recorded once as
+// missed at Warn when the transaction ends before anybody reads it.
+func TestServerTransactionWarnsWhenSuccessAckUnread(t *testing.T) {
+	tx, req, capture := newTestInviteServerTx(t, 10*time.Second)
+	require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusOK, "OK", nil)))
+	require.NoError(t, tx.Receive(newTestAck(req)))
+
+	tx.Terminate()
+
+	require.Eventually(t, func() bool { return capture.count("ACK missed") > 0 }, time.Second, 10*time.Millisecond)
+	require.Equal(t, 1, capture.count("ACK missed"))
+	r := capture.find(t, "ACK missed")
+	assert.Equal(t, slog.LevelWarn, r.Level)
+	var txKey string
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == "tx" {
+			txKey = a.Value.String()
+		}
+		return true
+	})
+	assert.Equal(t, tx.Key(), txKey)
 }
 
 func TestServerTransactionContext(t *testing.T) {

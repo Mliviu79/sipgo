@@ -225,7 +225,7 @@ func (tx *ServerTx) actRespondAccept() fsmInput {
 }
 
 func (tx *ServerTx) actPassupAck() fsmInput {
-	tx.passAck()
+	tx.passAck(false)
 	return FsmInputNone
 }
 
@@ -289,7 +289,7 @@ func (tx *ServerTx) actConfirm() fsmInput {
 
 	tx.mu.Unlock()
 
-	tx.passAck()
+	tx.passAck(true)
 	return FsmInputNone
 }
 
@@ -315,13 +315,15 @@ func (tx *ServerTx) actCancel() fsmInput {
 	return server_input_user_300_plus
 }
 
-func (tx *ServerTx) passAck() {
+// passAck offers the received ACK on Acks(). absorbed reports that the
+// transaction has already consumed it; see ackSend.
+func (tx *ServerTx) passAck(absorbed bool) {
 	r := tx.fsmAck
 	if r == nil {
 		return
 	}
 
-	tx.ackSendAsync(r)
+	tx.ackSendAsync(r, absorbed)
 }
 
 func (tx *ServerTx) passResp() error {
