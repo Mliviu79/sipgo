@@ -1,6 +1,8 @@
 package sip
 
 import (
+	"bytes"
+	"log/slog"
 	"net"
 	"sync"
 	"testing"
@@ -230,6 +232,166 @@ func TestWSConnectionKeepaliveDisabled(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("keepalive should return immediately when disabled")
 	}
+}
+
+// keepaliveLogBuffer is a mutex-guarded log sink, so a test can read what the
+// keepalive goroutine logged while that goroutine may still be writing.
+type keepaliveLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *keepaliveLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *keepaliveLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestWSConnectionKeepaliveAfterWriteDeadline checks that a keepalive frame
+// written after an earlier write's absolute deadline has passed still goes out,
+// both the ping the keepalive loop sends and the pong answering a peer's ping.
+// A net.Conn deadline is absolute, so a frame written under the deadline a SIP
+// write left behind fails once the connection has been quiet for longer than
+// the write timeout, even though the connection is healthy.
+func TestWSConnectionKeepaliveAfterWriteDeadline(t *testing.T) {
+	const writeTimeout = 100 * time.Millisecond
+
+	type peerFrame struct {
+		frame ws.Frame
+		err   error
+		at    time.Time
+	}
+
+	// start builds a server side connection through the transport's own
+	// constructor, writes one SIP frame through it and returns once the peer has
+	// read that frame. The deadline the write armed passes writeTimeout later.
+	start := func(t *testing.T) (*WSConnection, net.Conn, <-chan peerFrame, time.Time) {
+		t.Helper()
+		serverEnd, clientEnd := net.Pipe()
+		t.Cleanup(func() { _ = clientEnd.Close() })
+
+		c := (&TransportWS{WriteTimeout: writeTimeout}).newConnection(serverEnd, 1, false)
+
+		frames := make(chan peerFrame, 64)
+		go func() {
+			for {
+				f, err := ws.ReadFrame(clientEnd)
+				frames <- peerFrame{frame: f, err: err, at: time.Now()}
+				if err != nil {
+					return
+				}
+			}
+		}()
+
+		_, err := c.Write([]byte("OPTIONS sip:x SIP/2.0\r\n\r\n"))
+		require.NoError(t, err)
+		select {
+		case got := <-frames:
+			require.NoError(t, got.err)
+			require.Equal(t, ws.OpText, got.frame.Header.OpCode)
+			return c, clientEnd, frames, got.at
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for the SIP frame")
+			return nil, nil, nil, time.Time{}
+		}
+	}
+
+	t.Run("Ping", func(t *testing.T) {
+		prev := TransportWSKeepAlivePeriod
+		TransportWSKeepAlivePeriod = 500 * time.Millisecond
+		t.Cleanup(func() { TransportWSKeepAlivePeriod = prev })
+
+		c, _, frames, wroteAt := start(t)
+
+		logs := &keepaliveLogBuffer{}
+		log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		done := make(chan struct{})
+		go func() {
+			c.keepalive(log)
+			close(done)
+		}()
+		t.Cleanup(func() {
+			_ = c.Close()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Error("keepalive goroutine did not return after Close")
+			}
+		})
+
+		select {
+		case got := <-frames:
+			require.NoError(t, got.err, "peer lost the connection instead of receiving a ping; keepalive log: %s", logs.String())
+			assert.Equal(t, ws.OpPing, got.frame.Header.OpCode)
+			assert.True(t, got.at.After(wroteAt.Add(writeTimeout)),
+				"ping must arrive after the SIP write's deadline has passed, or the test proves nothing")
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timeout waiting for a keepalive ping; keepalive log: %s", logs.String())
+		}
+
+		select {
+		case <-done:
+			t.Fatalf("keepalive closed a healthy connection; keepalive log: %s", logs.String())
+		default:
+		}
+	})
+
+	t.Run("Pong", func(t *testing.T) {
+		c, clientEnd, frames, wroteAt := start(t)
+
+		readErr := make(chan error, 1)
+		readDone := make(chan struct{})
+		go func() {
+			defer close(readDone)
+			buf := make([]byte, 1024)
+			_, err := c.Read(buf)
+			readErr <- err
+		}()
+		t.Cleanup(func() {
+			_ = c.Close()
+			select {
+			case <-readDone:
+			case <-time.After(2 * time.Second):
+				t.Error("read loop did not return after Close")
+			}
+		})
+
+		// Establishes the precondition, not an assertion: the SIP write's
+		// deadline is now well in the past.
+		time.Sleep(time.Until(wroteAt.Add(3 * writeTimeout)))
+
+		payload := []byte("are-you-there")
+		pingErr := make(chan error, 1)
+		go func() {
+			// MaskFrameInPlace masks the payload it is given, so it gets a copy.
+			ping := ws.NewPingFrame(append([]byte(nil), payload...))
+			pingErr <- ws.WriteFrame(clientEnd, ws.MaskFrameInPlace(ping))
+		}()
+
+		select {
+		case got := <-frames:
+			require.NoError(t, got.err, "peer lost the connection instead of receiving a pong")
+			assert.Equal(t, ws.OpPong, got.frame.Header.OpCode)
+			assert.Equal(t, payload, got.frame.Payload, "pong must echo the ping payload")
+		case err := <-readErr:
+			t.Fatalf("read loop ended while answering the ping: %v", err)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for the pong")
+		}
+
+		require.NoError(t, <-pingErr)
+		select {
+		case err := <-readErr:
+			t.Fatalf("read loop ended after answering the ping: %v", err)
+		default:
+		}
+	})
 }
 
 // TestWSConnectionConcurrentWrites exercises pings racing SIP writes. Frames must

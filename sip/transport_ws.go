@@ -376,11 +376,31 @@ func (c *WSConnection) state() ws.State {
 	return ws.StateServerSide
 }
 
-// writeFrame writes a single frame. Every frame written on this connection must
-// go through here to keep writes serialized.
+// armWriteDeadline sets the write deadline for the frame about to be written to
+// now plus writeTimeout. A net.Conn deadline is absolute, so a frame written
+// under the deadline a previous write left behind fails once that moment has
+// passed, even on a healthy connection that has only been quiet. Callers hold
+// writeMu, which ties the deadline to the frame they write next; it must never
+// be called without that lock, or a concurrent writer's deadline could be moved
+// under it. A non-positive writeTimeout means no deadline and leaves the
+// connection untouched.
+func (c *WSConnection) armWriteDeadline() error {
+	if c.writeTimeout <= 0 {
+		return nil
+	}
+	return c.Conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+}
+
+// writeFrame writes a single frame under writeMu, with a fresh write deadline
+// armed for it. SIP data and keepalive pings go through here; the only other
+// frame writer is handleControlFrame, which writes the pong answering a peer's
+// ping under the same lock and arms its own deadline.
 func (c *WSConnection) writeFrame(f ws.Frame) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	if err := c.armWriteDeadline(); err != nil {
+		return err
+	}
 	return ws.WriteFrame(c.Conn, f)
 }
 
@@ -459,10 +479,14 @@ func (c *WSConnection) TryClose() (int, error) {
 // handleControlFrame answers a Ping with a Pong and discards a Pong, reading the
 // control payload out of reader either way. The write lock is held across the
 // whole handler because it may write a header and payload separately, and those
-// must not be split by a concurrent Write.
+// must not be split by a concurrent Write. It is the one frame writer besides
+// writeFrame, so it arms its own fresh write deadline under the same lock.
 func (c *WSConnection) handleControlFrame(header ws.Header, reader io.Reader, state ws.State) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	if err := c.armWriteDeadline(); err != nil {
+		return err
+	}
 	return wsutil.ControlHandler{
 		Src: reader,
 		Dst: c.Conn,
@@ -551,12 +575,6 @@ func (c *WSConnection) Read(b []byte) (n int, err error) {
 }
 
 func (c *WSConnection) Write(b []byte) (n int, err error) {
-	if c.writeTimeout > 0 {
-		if err := c.Conn.SetWriteDeadline(time.Now().Add(c.writeTimeout)); err != nil {
-			return 0, err
-		}
-	}
-
 	if SIPDebug {
 		logSIPWrite("WS", c.Conn.LocalAddr().String(), c.Conn.RemoteAddr().String(), b)
 	}
