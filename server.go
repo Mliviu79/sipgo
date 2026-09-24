@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync"
 
 	"github.com/emiago/sipgo/sip"
 )
@@ -28,6 +29,33 @@ func listenReadyCtx(ctx context.Context, network string, addr string) {
 		case ListenReadyFuncCtxValue:
 			vv(network, addr)
 		}
+	}
+}
+
+// readyPacketConn signals listen readiness on the serving loop's first read.
+// TransportUDP.Serve reaches that read only after the transport layer has recorded
+// the port in ListenPorts and pooled the listener, so a request sent from the
+// listening address at the ready instant reuses the listener.
+type readyPacketConn struct {
+	net.PacketConn
+	once  sync.Once
+	ready func()
+}
+
+func (c *readyPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	c.once.Do(c.ready)
+	return c.PacketConn.ReadFrom(b)
+}
+
+// packetConnSignalingReady returns conn wrapped to fire the ready value carried by
+// ctx on its first read, or conn itself when ctx carries none.
+func packetConnSignalingReady(ctx context.Context, conn net.PacketConn, network string, addr string) net.PacketConn {
+	if ctx.Value(ListenReadyCtxKey) == nil {
+		return conn
+	}
+	return &readyPacketConn{
+		PacketConn: conn,
+		ready:      func() { listenReadyCtx(ctx, network, addr) },
 	}
 }
 
@@ -94,6 +122,9 @@ func newBaseServer(ua *UserAgent, options ...ServerOption) (*Server, error) {
 
 // Serve will fire all listeners
 // Network supported: udp, tcp, ws
+// A ready value in ctx under ListenReadyCtxKey fires once the udp listener is
+// registered: its port is in ListenPorts and the listener is in the connection pool.
+// It never fires if serving fails before that.
 func (srv *Server) ListenAndServe(ctx context.Context, network string, addr string) error {
 	network = strings.ToLower(network)
 
@@ -120,8 +151,7 @@ func (srv *Server) ListenAndServe(ctx context.Context, network string, addr stri
 		}
 
 		go watchContext(udpConn)
-		listenReadyCtx(ctx, network, udpConn.LocalAddr().String())
-		return srv.tp.ServeUDP(udpConn)
+		return srv.tp.ServeUDP(packetConnSignalingReady(ctx, udpConn, network, udpConn.LocalAddr().String()))
 
 	case "tcp", "tcp4", "tcp6":
 		laddr, err := net.ResolveTCPAddr(network, addr)
