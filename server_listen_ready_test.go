@@ -2,6 +2,7 @@ package sipgo
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -175,4 +176,87 @@ func testListenReadyUDPRound(t *testing.T, kind string) {
 
 	cancel()
 	joinServe(t, errCh)
+}
+
+// streamListenReadyObservation is what the ready callback saw for a stream listener.
+type streamListenReadyObservation struct {
+	network string
+	addr    string
+	ports   []int
+}
+
+// TestListenReadyStreamListenPortRecorded guards the meaning of the listen-ready
+// signal for tcp, ws, tls and wss: when it fires, ListenPorts already holds the
+// listening port. It also pins the network and address the callback receives.
+func TestListenReadyStreamListenPortRecorded(t *testing.T) {
+	testCases := []struct {
+		network         string
+		encrypted       bool
+		portsKey        string
+		reportedNetwork string
+	}{
+		{network: "tcp", portsKey: "tcp", reportedNetwork: "tcp"},
+		{network: "ws", portsKey: "ws", reportedNetwork: "tcp"},
+		{network: "tls", encrypted: true, portsKey: "tls", reportedNetwork: "tls"},
+		{network: "wss", encrypted: true, portsKey: "wss", reportedNetwork: "wss"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.network, func(t *testing.T) {
+			for round := range listenReadyRounds {
+				t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) {
+					ua, err := NewUA()
+					require.NoError(t, err)
+					defer ua.Close()
+					srv, err := NewServer(ua)
+					require.NoError(t, err)
+					defer srv.Close()
+
+					addr := testFreeAddr(t, "tcp")
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+
+					obsCh := make(chan streamListenReadyObservation, 1)
+					ctx = context.WithValue(ctx, ListenReadyCtxKey, ListenReadyFuncCtxValue(func(network, readyAddr string) {
+						obsCh <- streamListenReadyObservation{
+							network: network,
+							addr:    readyAddr,
+							ports:   srv.TransportLayer().ListenPorts(tc.portsKey),
+						}
+					}))
+
+					var tlsConf *tls.Config
+					if tc.encrypted {
+						tlsConf = testServerTlsConfig(t)
+					}
+					errCh := make(chan error, 1)
+					go func() {
+						if tc.encrypted {
+							errCh <- srv.ListenAndServeTLS(ctx, tc.network, addr, tlsConf)
+							return
+						}
+						errCh <- srv.ListenAndServe(ctx, tc.network, addr)
+					}()
+
+					var obs streamListenReadyObservation
+					select {
+					case obs = <-obsCh:
+					case err := <-errCh:
+						t.Fatalf("serve returned before ready: %v", err)
+					case <-time.After(2 * time.Second):
+						t.Fatal("ready never fired")
+					}
+
+					_, port, err := sip.ParseAddr(addr)
+					require.NoError(t, err)
+					assert.Equal(t, tc.reportedNetwork, obs.network)
+					assert.Equal(t, addr, obs.addr)
+					assert.Contains(t, obs.ports, port, "ListenPorts must hold the port when ready fires")
+
+					cancel()
+					joinServe(t, errCh)
+				})
+			}
+		})
+	}
 }

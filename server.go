@@ -59,6 +59,32 @@ func packetConnSignalingReady(ctx context.Context, conn net.PacketConn, network 
 	}
 }
 
+// readyListener signals listen readiness on the serving loop's first Accept.
+// Stream listeners are never pooled, so readiness for them is the ListenPorts entry,
+// which TransportLayer.Serve* records before the serving loop's first Accept.
+type readyListener struct {
+	net.Listener
+	once  sync.Once
+	ready func()
+}
+
+func (l *readyListener) Accept() (net.Conn, error) {
+	l.once.Do(l.ready)
+	return l.Listener.Accept()
+}
+
+// listenerSignalingReady returns l wrapped to fire the ready value carried by ctx
+// on its first Accept, or l itself when ctx carries none.
+func listenerSignalingReady(ctx context.Context, l net.Listener, network string, addr string) net.Listener {
+	if ctx.Value(ListenReadyCtxKey) == nil {
+		return l
+	}
+	return &readyListener{
+		Listener: l,
+		ready:    func() { listenReadyCtx(ctx, network, addr) },
+	}
+}
+
 // RequestHandler is a callback that will be called on the incoming request
 type RequestHandler func(req *sip.Request, tx sip.ServerTransaction)
 
@@ -122,9 +148,9 @@ func newBaseServer(ua *UserAgent, options ...ServerOption) (*Server, error) {
 
 // Serve will fire all listeners
 // Network supported: udp, tcp, ws
-// A ready value in ctx under ListenReadyCtxKey fires once the udp listener is
-// registered: its port is in ListenPorts and the listener is in the connection pool.
-// It never fires if serving fails before that.
+// A ready value in ctx under ListenReadyCtxKey fires once the listener is
+// registered: its port is in ListenPorts and, for udp, the listener is in the
+// connection pool. It never fires if serving fails before that.
 func (srv *Server) ListenAndServe(ctx context.Context, network string, addr string) error {
 	network = strings.ToLower(network)
 
@@ -165,9 +191,7 @@ func (srv *Server) ListenAndServe(ctx context.Context, network string, addr stri
 		}
 
 		go watchContext(conn)
-		listenReadyCtx(ctx, network, conn.Addr().String())
-
-		return srv.tp.ServeTCP(conn)
+		return srv.tp.ServeTCP(listenerSignalingReady(ctx, conn, network, conn.Addr().String()))
 	case "ws", "ws4", "ws6":
 		ipv := network[2:]
 		network = "tcp" + ipv
@@ -182,15 +206,15 @@ func (srv *Server) ListenAndServe(ctx context.Context, network string, addr stri
 		}
 
 		go watchContext(conn)
-		listenReadyCtx(ctx, network, conn.Addr().String())
 		// and uses listener to buffer
-		return srv.tp.ServeWS(conn)
+		return srv.tp.ServeWS(listenerSignalingReady(ctx, conn, network, conn.Addr().String()))
 	}
 	return sip.ErrTransportNotSuported
 }
 
 // Serve will fire all listeners that are secured.
 // Network supported: tls, wss, tcp, tcp4, tcp6, ws, ws4, ws6
+// A ready value in ctx fires as described on ListenAndServe.
 func (srv *Server) ListenAndServeTLS(ctx context.Context, network string, addr string, conf *tls.Config) error {
 	network = strings.ToLower(network)
 
@@ -235,13 +259,13 @@ func (srv *Server) ListenAndServeTLS(ctx context.Context, network string, addr s
 		}
 
 		go watchContext(listener)
-		listenReadyCtx(ctx, network, listener.Addr().String())
+		servedListener := listenerSignalingReady(ctx, listener, network, listener.Addr().String())
 
 		if network == "wss" {
-			return srv.tp.ServeWSS(listener)
+			return srv.tp.ServeWSS(servedListener)
 		}
 
-		return srv.tp.ServeTLS(listener)
+		return srv.tp.ServeTLS(servedListener)
 	}
 
 	return sip.ErrTransportNotSuported
