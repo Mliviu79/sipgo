@@ -2,6 +2,7 @@ package sip
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
@@ -11,6 +12,11 @@ import (
 type TransactionRequestHandler func(req *Request, tx *ServerTx)
 type UnhandledResponseHandler func(req *Response)
 type ErrorHandler func(err error)
+
+// errMalformedRequest marks a request too malformed to key a server
+// transaction. rejectMalformedRequest has already answered and recorded it, so
+// the caller does not record it again.
+var errMalformedRequest = errors.New("malformed request")
 
 func defaultRequestHandler(r *Request, tx *ServerTx) {
 	DefaultLogger().Info("Unhandled sip request. OnRequest handler not added", "caller", "transactionLayer", "msg", r.Short())
@@ -148,6 +154,9 @@ func (txl *TransactionLayer) handleMessage(msg Message) {
 
 func (txl *TransactionLayer) handleRequestBackground(req *Request) {
 	if err := txl.handleRequest(req); err != nil {
+		if errors.Is(err, errMalformedRequest) {
+			return
+		}
 		txl.log.Error("Server tx failed to handle request", "error", err, "req", req.StartLine())
 	}
 }
@@ -164,7 +173,7 @@ func (txl *TransactionLayer) handleRequest(req *Request) error {
 		key, err := makeServerTxKey(req, INVITE)
 		if err != nil {
 			txl.rejectMalformedRequest(req, err)
-			return fmt.Errorf("make key failed: %w", err)
+			return fmt.Errorf("%w: make key failed: %w", errMalformedRequest, err)
 		}
 
 		tx, exists := txl.getServerTx(key)
@@ -189,14 +198,16 @@ func (txl *TransactionLayer) handleRequest(req *Request) error {
 	key, err := makeServerTxKey(req, "")
 	if err != nil {
 		txl.rejectMalformedRequest(req, err)
-		return fmt.Errorf("make key failed: %w", err)
+		return fmt.Errorf("%w: make key failed: %w", errMalformedRequest, err)
 	}
 
 	return txl.serverTxRequest(req, key)
 }
 
-// rejectMalformedRequest sends a stateless 400 Bad Request response when a
-// request is too malformed to create a transaction (e.g. missing CSeq or Via).
+// rejectMalformedRequest sends a stateless 400 response when a request is too
+// malformed to create a transaction (e.g. missing CSeq or Via). The reason
+// phrase names the missing header, as RFC 3261 Section 21.4.1 suggests, so the
+// sender learns what to fix.
 //
 // Per RFC 3261 Section 8.2:
 //
@@ -212,10 +223,16 @@ func (txl *TransactionLayer) handleRequest(req *Request) error {
 //
 // Without this, the sender retransmits indefinitely because it never
 // receives any response.
+//
+// The rejection is recorded at Debug. Any peer can send such a request before
+// it has authenticated, and no transaction absorbs a retransmission, so every
+// datagram lands here at a rate the peer chooses. The record carries the
+// method, the source and the phrase, never the message.
 func (txl *TransactionLayer) rejectMalformedRequest(req *Request, reason error) {
+	phrase := malformedRequestReason(req)
 	// Build a minimal 400 response from whatever headers the request has.
 	// NewResponseFromRequest safely skips nil CSeq, From, To, Call-ID.
-	res := NewResponseFromRequest(req, StatusBadRequest, "Bad Request", nil)
+	res := NewResponseFromRequest(req, StatusBadRequest, phrase, nil)
 
 	if err := txl.tpl.WriteMsg(res); err != nil {
 		txl.log.Error("Failed to send stateless 400 for malformed request",
@@ -224,6 +241,41 @@ func (txl *TransactionLayer) rejectMalformedRequest(req *Request, reason error) 
 			"req", req.StartLine(),
 		)
 	}
+	txl.log.Debug("Rejected malformed request",
+		"method", req.Method,
+		"src", req.Source(),
+		"reason", phrase,
+		"error", reason,
+	)
+}
+
+// malformedRequestReason returns the reason phrase for the header that
+// makeServerTxKey could not build a key without, or "Bad Request" when none is
+// missing. It checks the headers in makeServerTxKey's order: Via, CSeq, then,
+// only when the top Via branch is not an RFC 3261 branch, From, the From tag
+// and Call-ID.
+func malformedRequestReason(req *Request) string {
+	via := req.Via()
+	if via == nil {
+		return "Missing Via Header Field"
+	}
+	if req.CSeq() == nil {
+		return "Missing CSeq Header Field"
+	}
+	branch, _ := via.Params.Get("branch")
+	if isRFC3261(branch) {
+		return "Bad Request"
+	}
+	from := req.From()
+	switch {
+	case from == nil:
+		return "Missing From Header Field"
+	case !from.Params.Has("tag"):
+		return "Missing From Tag"
+	case req.CallID() == nil:
+		return "Missing Call-ID Header Field"
+	}
+	return "Bad Request"
 }
 
 func (txl *TransactionLayer) serverTxRequest(req *Request, key string) error {

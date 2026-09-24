@@ -131,6 +131,7 @@ func TestTransactionLayerMalformedRequestStateless400(t *testing.T) {
 	err = txl.handleRequest(req)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "CSeq")
+	assert.ErrorIs(t, err, errMalformedRequest)
 
 	// The request handler should NOT have been called.
 	assert.EqualValues(t, 0, atomic.LoadInt32(&handlerCalled))
@@ -147,7 +148,52 @@ func TestTransactionLayerMalformedRequestStateless400(t *testing.T) {
 	resp, ok := respMsg.(*Response)
 	require.True(t, ok, "expected a SIP response")
 	assert.Equal(t, 400, resp.StatusCode)
-	assert.Equal(t, "Bad Request", resp.Reason)
+	assert.Equal(t, "Missing CSeq Header Field", resp.Reason)
+}
+
+// TestTransactionLayerMalformedRequestReason pins the stateless 400's reason
+// phrase to makeServerTxKey: every header the key cannot be built without gets
+// its own phrase, and a request the key accepts gets the plain fallback.
+func TestTransactionLayerMalformedRequestReason(t *testing.T) {
+	const (
+		rfc3261Via = "Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKreason1"
+		rfc2543Via = "Via: SIP/2.0/UDP 10.0.0.1:5060;branch=reason1"
+		from       = "From: <sip:alice@example.com>;tag=from1"
+		fromNoTag  = "From: <sip:alice@example.com>"
+		callID     = "Call-ID: reason-call-id"
+		cseq       = "CSeq: 1 OPTIONS"
+	)
+
+	tests := []struct {
+		name    string
+		headers []string
+		reason  string
+	}{
+		{name: "missing Via", headers: []string{from, callID, cseq}, reason: "Missing Via Header Field"},
+		{name: "missing CSeq", headers: []string{rfc3261Via, from, callID}, reason: "Missing CSeq Header Field"},
+		{name: "missing From without RFC 3261 branch", headers: []string{rfc2543Via, callID, cseq}, reason: "Missing From Header Field"},
+		{name: "missing From tag without RFC 3261 branch", headers: []string{rfc2543Via, fromNoTag, callID, cseq}, reason: "Missing From Tag"},
+		{name: "missing Call-ID without RFC 3261 branch", headers: []string{rfc2543Via, from, cseq}, reason: "Missing Call-ID Header Field"},
+		{name: "missing From with RFC 3261 branch", headers: []string{rfc3261Via, callID, cseq}, reason: "Bad Request"},
+		{name: "well formed with RFC 3261 branch", headers: []string{rfc3261Via, from, callID, cseq}, reason: "Bad Request"},
+		{name: "well formed without RFC 3261 branch", headers: []string{rfc2543Via, from, callID, cseq}, reason: "Bad Request"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := append([]string{"OPTIONS sip:bob@example.com SIP/2.0"}, tc.headers...)
+			raw = append(raw, "To: <sip:bob@example.com>", "Content-Length: 0", "", "")
+			req := testCreateMessage(t, raw).(*Request)
+
+			_, keyErr := makeServerTxKey(req, "")
+			if tc.reason == "Bad Request" {
+				require.NoError(t, keyErr)
+			} else {
+				require.Error(t, keyErr)
+			}
+			assert.Equal(t, tc.reason, malformedRequestReason(req))
+		})
+	}
 }
 
 func TestTransactionLayerClientTx(t *testing.T) {
