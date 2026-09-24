@@ -2,6 +2,8 @@ package sip
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"net"
 	"os"
 	"strings"
@@ -10,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/emiago/sipgo/fakes"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -178,4 +181,100 @@ func TestTransactionLayerClientTx(t *testing.T) {
 	require.EqualValues(t, 1, atomic.LoadInt32(&count))
 	require.Equal(t, 2, tp.udp.pool.Size())
 	assert.True(t, tp.udp.pool.Get("127.0.0.1:9876") != nil)
+}
+
+// lockedBuffer collects the bytes a server transaction writes. Writes can come
+// from a transaction timer goroutine, so reads and writes share a mutex.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestTransactionLayerRecoversPanickingHandler drives the one place the layer
+// hands a request to user code with a real server transaction. A panic that
+// escapes it is caught by the test itself, so a missing recover shows up as an
+// assertion failure rather than as a crashed test binary.
+func TestTransactionLayerRecoversPanickingHandler(t *testing.T) {
+	const sentinel = "sipgo test handler panic"
+
+	newLayer := func(t *testing.T, handler TransactionRequestHandler) (*TransactionLayer, *logCapture) {
+		t.Helper()
+		capture := &logCapture{}
+		tpl := NewTransportLayer(net.DefaultResolver, NewParser(), nil)
+		t.Cleanup(func() { _ = tpl.Close() })
+		txl := NewTransactionLayer(tpl, WithTransactionLayerLogger(slog.New(capture)))
+		txl.OnRequest(handler)
+		return txl, capture
+	}
+	newTx := func(t *testing.T, req *Request) (*ServerTx, *lockedBuffer) {
+		t.Helper()
+		outgoing := &lockedBuffer{}
+		conn := &UDPConnection{
+			PacketConn: &fakes.UDPConn{
+				Reader:  strings.NewReader(""),
+				Writers: map[string]io.Writer{"127.0.0.1:5060": outgoing},
+			},
+		}
+		// The reference serverRequestConnection takes for a new transaction,
+		// released when the transaction ends.
+		conn.Ref(1)
+		tx := NewServerTx("panic-"+req.Method.String(), req, conn, slog.New(&logCapture{}))
+		require.NoError(t, tx.Init())
+		return tx, outgoing
+	}
+	run := func(txl *TransactionLayer, req *Request, tx *ServerTx) (escaped any) {
+		defer func() { escaped = recover() }()
+		txl.runRequestHandler(req, tx)
+		return nil
+	}
+	waitDone := func(t *testing.T, tx *ServerTx) {
+		t.Helper()
+		select {
+		case <-tx.Done():
+		case <-time.After(2 * time.Second):
+			t.Fatal("transaction did not end after the recovered panic")
+		}
+	}
+
+	t.Run("unanswered request gets 500 and the transaction ends", func(t *testing.T) {
+		txl, capture := newLayer(t, func(req *Request, tx *ServerTx) {
+			panic(sentinel)
+		})
+		req := testCreateRequest(t, "OPTIONS", "sip:example.com", "TCP", "127.0.0.1:5060")
+		tx, outgoing := newTx(t, req)
+
+		escaped := run(txl, req, tx)
+		require.Nil(t, escaped, "the handler panic escaped the transaction layer")
+
+		assert.Contains(t, outgoing.String(), "SIP/2.0 500 Server Internal Error")
+		waitDone(t, tx)
+
+		rec := capture.find(t, "Request handler panicked")
+		assert.Equal(t, slog.LevelError, rec.Level)
+		fields := flatten(rec)
+		assert.Contains(t, fields, "method=OPTIONS")
+		assert.Contains(t, fields, "callid="+req.CallID().Value())
+		assert.Contains(t, fields, "panic="+sentinel)
+		var stack string
+		rec.Attrs(func(a slog.Attr) bool {
+			if a.Key == "stack" {
+				stack = a.Value.String()
+			}
+			return true
+		})
+		assert.Contains(t, stack, "TestTransactionLayerRecoversPanickingHandler")
+		assert.Contains(t, fields, "tx="+tx.Key())
+	})
 }

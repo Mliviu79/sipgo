@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"time"
 )
 
@@ -276,8 +277,46 @@ func (txl *TransactionLayer) serverTxRequest(req *Request, key string) error {
 	txl.serverTransactions.unlock()
 
 	// pass request and transaction to handler
-	txl.reqHandler(req, tx)
+	txl.runRequestHandler(req, tx)
 	return nil
+}
+
+// runRequestHandler is where the transaction layer hands a request and its
+// server transaction to user code. A panic in that code is recovered here, so
+// one faulty handler costs its own transaction rather than the process.
+func (txl *TransactionLayer) runRequestHandler(req *Request, tx *ServerTx) {
+	defer txl.recoverRequestHandler(req, tx)
+	txl.reqHandler(req, tx)
+}
+
+// recoverRequestHandler must be deferred by runRequestHandler itself, since
+// recover only stops a panic when called by the deferred function. On a panic
+// it logs the method, Call-ID, panic value and stack once at Error, answers
+// '500 Server Internal Error' without any detail of the panic, and ends the
+// transaction the same way a handler that returns does.
+func (txl *TransactionLayer) recoverRequestHandler(req *Request, tx *ServerTx) {
+	value := recover()
+	if value == nil {
+		return
+	}
+
+	callID := ""
+	if h := req.CallID(); h != nil {
+		callID = h.Value()
+	}
+	txl.log.Error("Request handler panicked",
+		"method", req.Method.String(),
+		"callid", callID,
+		"panic", fmt.Sprint(value),
+		"stack", string(debug.Stack()),
+		"tx", tx.Key(),
+	)
+
+	res := NewResponseFromRequest(req, StatusInternalServerError, "Server Internal Error", nil)
+	if err := tx.Respond(res); err != nil {
+		txl.log.Error("respond '500 Server Internal Error' failed", "error", err, "tx", tx.Key())
+	}
+	tx.TerminateGracefully()
 }
 
 func (txl *TransactionLayer) serverTxCreate(req *Request, key string) (*ServerTx, error) {
