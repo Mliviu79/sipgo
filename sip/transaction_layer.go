@@ -292,8 +292,9 @@ func (txl *TransactionLayer) runRequestHandler(req *Request, tx *ServerTx) {
 // recoverRequestHandler must be deferred by runRequestHandler itself, since
 // recover only stops a panic when called by the deferred function. On a panic
 // it logs the method, Call-ID, panic value and stack once at Error, answers
-// '500 Server Internal Error' without any detail of the panic, and ends the
-// transaction the same way a handler that returns does.
+// '500 Server Internal Error' without any detail of the panic unless the
+// handler already sent a final response, and ends the transaction the same
+// way a handler that returns does.
 func (txl *TransactionLayer) recoverRequestHandler(req *Request, tx *ServerTx) {
 	value := recover()
 	if value == nil {
@@ -313,8 +314,8 @@ func (txl *TransactionLayer) recoverRequestHandler(req *Request, tx *ServerTx) {
 	)
 
 	res := NewResponseFromRequest(req, StatusInternalServerError, "Server Internal Error", nil)
-	if err := tx.Respond(res); err != nil {
-		txl.log.Error("respond '500 Server Internal Error' failed", "error", err, "tx", tx.Key())
+	if !tx.respondUnlessFinalized(res) {
+		txl.log.Debug("Final response already sent, 500 skipped", "tx", tx.Key())
 	}
 	tx.TerminateGracefully()
 }

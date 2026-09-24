@@ -277,4 +277,45 @@ func TestTransactionLayerRecoversPanickingHandler(t *testing.T) {
 		assert.Contains(t, stack, "TestTransactionLayerRecoversPanickingHandler")
 		assert.Contains(t, fields, "tx="+tx.Key())
 	})
+
+	t.Run("final response already sent is kept", func(t *testing.T) {
+		txl, _ := newLayer(t, func(req *Request, tx *ServerTx) {
+			if err := tx.Respond(NewResponseFromRequest(req, StatusOK, "OK", nil)); err != nil {
+				t.Errorf("respond 200: %v", err)
+			}
+			panic(sentinel)
+		})
+		req := testCreateRequest(t, "OPTIONS", "sip:example.com", "TCP", "127.0.0.1:5060")
+		tx, outgoing := newTx(t, req)
+
+		escaped := run(txl, req, tx)
+		require.Nil(t, escaped, "the handler panic escaped the transaction layer")
+
+		tx.fsmMu.Lock()
+		stored := tx.fsmResp
+		tx.fsmMu.Unlock()
+		require.NotNil(t, stored)
+		assert.Equal(t, StatusOK, stored.StatusCode, "the final response retransmissions are answered with")
+		assert.Contains(t, outgoing.String(), "SIP/2.0 200")
+		assert.NotContains(t, outgoing.String(), "SIP/2.0 500")
+		waitDone(t, tx)
+	})
+
+	t.Run("provisional only still gets 500", func(t *testing.T) {
+		txl, _ := newLayer(t, func(req *Request, tx *ServerTx) {
+			if err := tx.Respond(NewResponseFromRequest(req, StatusRinging, "Ringing", nil)); err != nil {
+				t.Errorf("respond 180: %v", err)
+			}
+			panic(sentinel)
+		})
+		req, _, _ := testCreateInvite(t, "sip:example.com", "TCP", "127.0.0.1:5060")
+		tx, outgoing := newTx(t, req)
+
+		escaped := run(txl, req, tx)
+		require.Nil(t, escaped, "the handler panic escaped the transaction layer")
+
+		assert.Contains(t, outgoing.String(), "SIP/2.0 180")
+		assert.Contains(t, outgoing.String(), "SIP/2.0 500 Server Internal Error")
+		waitDone(t, tx)
+	})
 }

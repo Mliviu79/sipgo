@@ -2,6 +2,7 @@ package sipgo
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"os"
@@ -93,6 +94,12 @@ func TestServerRecoversPanickingHandler(t *testing.T) {
 	srv.OnInfo(func(req *sip.Request, tx sip.ServerTransaction) {
 		panic(handlerPanicSentinel)
 	})
+	srv.OnMessage(func(req *sip.Request, tx sip.ServerTransaction) {
+		if err := tx.Respond(sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)); err != nil {
+			t.Errorf("respond 200 to MESSAGE: %v", err)
+		}
+		panic(handlerPanicSentinel)
+	})
 	srv.OnOptions(func(req *sip.Request, tx sip.ServerTransaction) {
 		if err := tx.Respond(sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)); err != nil {
 			t.Errorf("respond 200 to OPTIONS: %v", err)
@@ -167,4 +174,26 @@ func TestServerRecoversPanickingHandler(t *testing.T) {
 	secondInfo := createSimpleRequest(sip.INFO, clientURI, serverURI, "UDP")
 	send(t, []byte(secondInfo.String()))
 	assertServerError(t, secondInfo, receive(t))
+
+	// A handler that answered before panicking keeps its answer: the
+	// retransmitted request is answered from the transaction with the same
+	// final response, and nothing else is sent.
+	message := createSimpleRequest(sip.MESSAGE, clientURI, serverURI, "UDP")
+	rawMessage := []byte(message.String())
+	send(t, rawMessage)
+	assert.Equal(t, sip.StatusOK, receive(t).StatusCode)
+
+	send(t, rawMessage)
+	assert.Equal(t, sip.StatusOK, receive(t).StatusCode, "retransmission must get the response already sent")
+
+	require.NoError(t, clientConn.SetReadDeadline(time.Now().Add(300*time.Millisecond)))
+	buf := make([]byte, 65535)
+	n, _, err := clientConn.ReadFrom(buf)
+	var netErr net.Error
+	require.True(t, errors.As(err, &netErr) && netErr.Timeout(), "unexpected datagram %q (err %v)", buf[:n], err)
+
+	level, attrs, ok = capture.panicRecord(message.CallID().Value())
+	require.True(t, ok, "no 'Request handler panicked' record for the MESSAGE")
+	assert.Equal(t, slog.LevelError, level)
+	assert.Equal(t, "MESSAGE", attrs["method"])
 }

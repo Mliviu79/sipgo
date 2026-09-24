@@ -127,6 +127,29 @@ func (tx *ServerTx) Respond(res *Response) error {
 	return tx.Err()
 }
 
+// respondUnlessFinalized sends res, a 300+ response, only when no final
+// response was sent on this transaction, and reports whether it sent it. A
+// final response already sent is never overwritten, so retransmissions keep
+// getting it. The check and the send happen under one hold of the state lock,
+// so a response sent concurrently cannot slip in between them.
+func (tx *ServerTx) respondUnlessFinalized(res *Response) bool {
+	tx.mu.Lock()
+	if tx.timer_1xx != nil {
+		tx.timer_1xx.Stop()
+		tx.timer_1xx = nil
+	}
+	tx.mu.Unlock()
+
+	tx.fsmMu.Lock()
+	defer tx.fsmMu.Unlock()
+	if tx.fsmResp != nil && !tx.fsmResp.IsProvisional() {
+		return false
+	}
+	tx.fsmResp = res
+	tx.spinFsmUnsafe(server_input_user_300_plus)
+	return true
+}
+
 // Acks makes channel for sending acks. Channel is created on demand
 func (tx *ServerTx) Acks() <-chan *Request {
 	return tx.acks
