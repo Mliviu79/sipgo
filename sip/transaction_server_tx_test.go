@@ -95,8 +95,12 @@ func TestServerTransactionNonInviteFSM(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, compareFunctions(tx.currentFsmState(), tx.stateCompleted))
 
-		// Timer j must be started
-		require.NotNil(t, tx.timer_j)
+		// Timer j must be started. Its callback clears tx.timer_j under tx.mu
+		// when it fires, so the test reads it under the same lock.
+		tx.mu.Lock()
+		timerJ := tx.timer_j
+		tx.mu.Unlock()
+		require.NotNil(t, timerJ)
 	})
 
 	t.Run("TCP", func(t *testing.T) {
