@@ -2,6 +2,7 @@ package sipgo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -68,6 +69,12 @@ func TestIntegrationDialog(t *testing.T) {
 		require.NoError(t, err)
 
 		err = dlg.Respond(sip.StatusOK, "OK", nil)
+		if errors.Is(err, ErrDialogEndedBeforeAck) {
+			// Requests are handled on goroutines of their own, so the BYE that
+			// the UAC sends right behind its ACK can be read first and end the
+			// dialog before the ACK is read.
+			return
+		}
 		require.NoError(t, err)
 
 		state := dlg.LoadState()

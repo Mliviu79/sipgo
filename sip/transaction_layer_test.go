@@ -206,25 +206,41 @@ func TestTransactionLayerClientTx(t *testing.T) {
 
 	req := testCreateRequest(t, "OPTIONS", "sip:127.0.0.1:9876", "UDP", "127.0.0.1:15070")
 
-	wg := sync.WaitGroup{}
-	wg.Add(3)
-	var count int32
-	for range []int{0, 1, 2} {
-		go func() {
-			defer wg.Done()
-			tx, err := txl.Request(context.TODO(), req)
-			if err != nil {
-				t.Log("Request failed with err", err)
-				return
-			}
-			atomic.AddInt32(&count, 1)
-			require.Equal(t, req, tx.origin)
-		}()
+	// Each goroutine sends a copy of the request, which has the same
+	// transaction key: the transport layer writes into the request it sends.
+	// The results are checked on the test goroutine.
+	type result struct {
+		sent *Request
+		tx   *ClientTx
+		err  error
+	}
+	const requests = 3
+	results := make(chan result, requests)
+	for range requests {
+		go func(sent *Request) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			tx, err := txl.Request(ctx, sent)
+			results <- result{sent: sent, tx: tx, err: err}
+		}(req.Clone())
 	}
 
-	wg.Wait()
+	count := 0
+	for i := range requests {
+		select {
+		case r := <-results:
+			if r.err != nil {
+				t.Log("Request failed with err", r.err)
+				continue
+			}
+			count++
+			require.Same(t, r.sent, r.tx.origin)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%d of %d requests did not return", requests-i, requests)
+		}
+	}
 	// Only one transaction will be created and executed
-	require.EqualValues(t, 1, atomic.LoadInt32(&count))
+	require.Equal(t, 1, count)
 	require.Equal(t, 2, tp.udp.pool.Size())
 	assert.True(t, tp.udp.pool.Get("127.0.0.1:9876") != nil)
 }
