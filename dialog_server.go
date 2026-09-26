@@ -261,7 +261,8 @@ func (s *DialogServerSession) authDigest(chal *digest.Challenge, opts digest.Opt
 //
 // A 2xx is retransmitted until its ACK is read, which WriteResponse waits for.
 // If no ACK arrives within 64*T1, the dialog is confirmed and ErrDialogAckTimeout
-// is returned: end the session with Bye (RFC 3261 section 13.3.1.4).
+// is returned: end the session with Bye (RFC 3261 section 13.3.1.4). If the
+// dialog ends first, ErrDialogEndedBeforeAck is returned.
 func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 	tx := s.inviteTx
 
@@ -324,7 +325,7 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 		if err := tx.Err(); err != nil {
 			return err
 		}
-		return fmt.Errorf("No ACK received")
+		return ErrDialogEndedBeforeAck
 	}
 
 	// Wait now for ACK for our 2xx
@@ -377,7 +378,7 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 		}
 	}
 	if state != sip.DialogStateConfirmed {
-		return fmt.Errorf("No ACK received")
+		return ErrDialogEndedBeforeAck
 	}
 	return nil
 }

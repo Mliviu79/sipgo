@@ -293,7 +293,7 @@ func TestDialogServerAckAfterBye(t *testing.T) {
 
 	select {
 	case err := <-answered:
-		require.Error(t, err, "the dialog ended before its 2xx was acknowledged")
+		require.ErrorIs(t, err, ErrDialogEndedBeforeAck)
 	case <-time.After(5 * time.Second):
 		t.Fatal("WriteResponse did not return after the dialog ended")
 	}
@@ -574,7 +574,7 @@ func TestDialogServerEndedWhileAnswering(t *testing.T) {
 	go func() { answered <- d.WriteResponse(res200) }()
 	select {
 	case err := <-answered:
-		require.Error(t, err, "the dialog ended before its 2xx was acknowledged")
+		require.ErrorIs(t, err, ErrDialogEndedBeforeAck)
 	case <-time.After(5 * time.Second):
 		t.Fatal("WriteResponse waits for the ACK of a dialog that has ended")
 	}

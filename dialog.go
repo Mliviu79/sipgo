@@ -18,6 +18,9 @@ var (
 	// for 64*T1 without an ACK. The dialog is then confirmed, and the session
 	// should be ended with a BYE (RFC 3261 section 13.3.1.4).
 	ErrDialogAckTimeout = errors.New("no ACK received for 2xx within 64*T1")
+	// ErrDialogEndedBeforeAck is returned when the dialog ends before the ACK
+	// to its 2xx is read, for example on a BYE.
+	ErrDialogEndedBeforeAck = errors.New("No ACK received")
 )
 
 type ErrDialogResponse struct {
