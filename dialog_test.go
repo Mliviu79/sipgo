@@ -181,6 +181,75 @@ func TestDialogStateCallbacksInOrder(t *testing.T) {
 	})
 }
 
+// TestDialogStateReplayInOrder registers a callback with OnStateReplay while
+// earlier transitions are still being told. The callback is told the state the
+// dialog is in, then each later transition, in order: never a replayed state
+// ahead of a queued one.
+func TestDialogStateReplayInOrder(t *testing.T) {
+	newDialog := func(t *testing.T) *Dialog {
+		inv, _, _ := createTestInvite(t, "sip:nowhere", "udp", "127.0.0.1")
+		d := &Dialog{InviteRequest: inv}
+		d.Init()
+		return d
+	}
+
+	t.Run("WhileTelling", func(t *testing.T) {
+		d := newDialog(t)
+		// Holds the notification of Established until the dialog has been
+		// confirmed and ended, and the replay registered, on the test
+		// goroutine.
+		holding := make(chan struct{})
+		release := make(chan struct{})
+		d.OnState(func(s sip.DialogState) {
+			if s != sip.DialogStateEstablished {
+				return
+			}
+			close(holding)
+			select {
+			case <-release:
+			case <-time.After(5 * time.Second):
+			}
+		})
+
+		established := make(chan struct{})
+		go func() {
+			defer close(established)
+			d.setState(sip.DialogStateEstablished)
+		}()
+		select {
+		case <-holding:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Established was not notified")
+		}
+
+		d.setState(sip.DialogStateConfirmed)
+		d.setState(sip.DialogStateEnded)
+		rec := &stateRecorder{}
+		assert.Equal(t, sip.DialogStateEnded, d.OnStateReplay(rec.record))
+		close(release)
+		select {
+		case <-established:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the transition to Established did not return")
+		}
+		assert.Equal(t, []sip.DialogState{sip.DialogStateEnded}, rec.recorded())
+	})
+
+	t.Run("Idle", func(t *testing.T) {
+		d := newDialog(t)
+		d.setState(sip.DialogStateEstablished)
+		d.setState(sip.DialogStateConfirmed)
+
+		rec := &stateRecorder{}
+		assert.Equal(t, sip.DialogStateConfirmed, d.OnStateReplay(rec.record))
+		// Told before OnStateReplay returns, as nothing else was being told.
+		assert.Equal(t, []sip.DialogState{sip.DialogStateConfirmed}, rec.recorded())
+
+		d.setState(sip.DialogStateEnded)
+		assert.Equal(t, []sip.DialogState{sip.DialogStateConfirmed, sip.DialogStateEnded}, rec.recorded())
+	})
+}
+
 func BenchmarkDialogSettingState(b *testing.B) {
 	inv, _, _ := createTestInvite(b, "sip:nowhere", "udp", "127.0.0.1")
 	d := Dialog{

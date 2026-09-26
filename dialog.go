@@ -33,6 +33,16 @@ func (e ErrDialogResponse) Error() string {
 }
 
 type DialogStateFn func(s sip.DialogState)
+
+// stateNotice is an entry of the queue of states the state callbacks are yet
+// to be told of. With replay set it is a callback that OnStateReplay
+// registers, which is added to the callbacks once the entries ahead of it are
+// told, and told of state alone.
+type stateNotice struct {
+	state  sip.DialogState
+	replay DialogStateFn
+}
+
 type Dialog struct {
 	ID string
 
@@ -52,7 +62,7 @@ type Dialog struct {
 	// stateMu orders the state transitions and guards the queue of those
 	// the state callbacks are yet to be told of, see transition.
 	stateMu        sync.Mutex
-	stateQueue     []sip.DialogState
+	stateQueue     []stateNotice
 	stateNotifying bool
 
 	ctx    context.Context
@@ -99,10 +109,21 @@ func (d *Dialog) OnState(f DialogStateFn) {
 
 }
 
+// OnStateReplay adds f to the callbacks told of each state transition, as
+// OnState does, and tells f first of the state the dialog is in, which it
+// returns. f is told of that state and then of each later transition, in the
+// order the dialog took them. When transitions are still being told, f is added
+// and told of the state once they have been, and so possibly after
+// OnStateReplay has returned.
 func (d *Dialog) OnStateReplay(f DialogStateFn) sip.DialogState {
-	d.OnState(f)
+	d.stateMu.Lock()
 	state := d.LoadState()
-	f(state)
+	notify := d.enqueueStateUnsafe(stateNotice{state: state, replay: f})
+	d.stateMu.Unlock()
+
+	if notify {
+		d.notifyStates()
+	}
 	return state
 }
 
@@ -143,15 +164,23 @@ func (d *Dialog) transition(s sip.DialogState, cause error) bool {
 		// Before any callback is told of the end.
 		d.cancel(cause)
 	}
-	d.stateQueue = append(d.stateQueue, s)
-	notify := !d.stateNotifying
-	d.stateNotifying = true
+	notify := d.enqueueStateUnsafe(stateNotice{state: s})
 	d.stateMu.Unlock()
 
 	if notify {
 		d.notifyStates()
 	}
 	return true
+}
+
+// enqueueStateUnsafe queues n for the state callbacks and reports whether the
+// caller is to tell them of the queue, as nobody is doing it. It must be called
+// with stateMu held.
+func (d *Dialog) enqueueStateUnsafe(n stateNotice) bool {
+	d.stateQueue = append(d.stateQueue, n)
+	notify := !d.stateNotifying
+	d.stateNotifying = true
+	return notify
 }
 
 // notifyStates tells the state callbacks of each queued transition in turn,
@@ -176,13 +205,18 @@ func (d *Dialog) notifyStates() {
 			emptied = true
 			return
 		}
-		s := d.stateQueue[0]
+		n := d.stateQueue[0]
 		d.stateQueue = d.stateQueue[1:]
 		d.stateMu.Unlock()
 
+		if n.replay != nil {
+			d.OnState(n.replay)
+			n.replay(n.state)
+			continue
+		}
 		if f := d.onStatePointer.Load(); f != nil {
 			cb := *f
-			cb(s)
+			cb(n.state)
 		}
 	}
 }
