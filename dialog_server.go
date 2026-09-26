@@ -412,6 +412,10 @@ func (s *DialogServerSession) Bye(ctx context.Context) error {
 	return s.WriteBye(ctx, bye)
 }
 
+// WriteBye sends bye, once the ACK to our 2xx is read or the INVITE
+// transaction has timed out, and waits within ctx for its answer. The dialog
+// ends as soon as bye is passed to its client transaction (RFC 3261 section
+// 15.1.1), whatever the answer.
 func (s *DialogServerSession) WriteBye(ctx context.Context, bye *sip.Request) error {
 	state := s.state.Load()
 	// In case dialog terminated
@@ -461,6 +465,8 @@ func (s *DialogServerSession) WriteBye(ctx context.Context, bye *sip.Request) er
 		return err
 	}
 	defer tx.Terminate() // Terminates current transaction
+	ctx, cancel := s.endOnBye(ctx)
+	defer cancel()
 
 	// Wait 200
 	select {
@@ -468,7 +474,6 @@ func (s *DialogServerSession) WriteBye(ctx context.Context, bye *sip.Request) er
 		if res.StatusCode != 200 {
 			return ErrDialogResponse{res}
 		}
-		s.setState(sip.DialogStateEnded)
 		return nil
 	case <-tx.Done():
 		return tx.Err()

@@ -1,12 +1,14 @@
 package sipgo
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/emiago/sipgo/sip"
+	"github.com/emiago/sipgo/siptest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -268,4 +270,123 @@ func BenchmarkDialogSettingState(b *testing.B) {
 		b.Error("On state not called")
 	}
 
+}
+
+// byeInFlight answers each request with a 200, but holds the BYE's until
+// release is closed, reporting on inFlight that the BYE reached the
+// transaction.
+type byeInFlight struct {
+	inFlight chan struct{}
+	release  chan struct{}
+}
+
+func newByeInFlight() *byeInFlight {
+	return &byeInFlight{inFlight: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (b *byeInFlight) respond(req *sip.Request, w *siptest.ClientTxResponder) {
+	res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
+	if req.IsInvite() {
+		res.To().Params.Add("tag", sip.GenerateTagN(16))
+		res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "uas", Host: "127.0.0.1", Port: 5090}})
+	}
+	if req.Method == sip.BYE {
+		close(b.inFlight)
+		select {
+		case <-b.release:
+		case <-time.After(10 * time.Second):
+			return
+		}
+	}
+	w.Receive(res)
+}
+
+// TestDialogByeEndsSessionWhenSent sends our BYE, on each side, and holds its
+// 200. RFC 3261 section 15.1.1 has the session over as soon as the BYE is
+// passed to its client transaction, so a request the peer sends meanwhile,
+// such as a re-INVITE, must find the dialog ended: its state is Ended and its
+// context done while the BYE is in flight. Bye still waits for the 200, also
+// on a context derived from the dialog's, which ends with the dialog.
+func TestDialogByeEndsSessionWhenSent(t *testing.T) {
+	sides := []struct {
+		name string
+		// newConfirmed returns a confirmed dialog whose requests b answers,
+		// and its Bye.
+		newConfirmed func(t *testing.T, b *byeInFlight) (*Dialog, func(context.Context) error)
+	}{
+		{
+			name: "UAS",
+			newConfirmed: func(t *testing.T, b *byeInFlight) (*Dialog, func(context.Context) error) {
+				cli := testClientResponder(t, b.respond)
+				dialogSrv := NewDialogServerCache(cli, sip.ContactHeader{
+					Address: sip.Uri{User: "test", Host: "127.0.0.200", Port: 5099},
+				})
+				invite, _, _ := createTestInvite(t, "sip:uas@127.0.0.1", "udp", "127.0.0.1:5090")
+				invite.AppendHeader(&sip.ContactHeader{Address: sip.Uri{Host: "uas", Port: 1234}})
+				tx := siptest.NewServerTxRecorder(invite)
+				t.Cleanup(tx.Terminate)
+				d, err := dialogSrv.ReadInvite(invite, tx)
+				require.NoError(t, err)
+				t.Cleanup(func() { d.Close() })
+				d.InviteResponse = sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil)
+				d.setState(sip.DialogStateConfirmed)
+				return &d.Dialog, d.Bye
+			},
+		},
+		{
+			name: "UAC",
+			newConfirmed: func(t *testing.T, b *byeInFlight) (*Dialog, func(context.Context) error) {
+				dua := DialogUA{
+					Client:     testClientResponder(t, b.respond),
+					ContactHDR: sip.ContactHeader{Address: sip.Uri{User: "uac", Host: "127.0.0.1", Port: 5060}},
+				}
+				d, err := dua.Invite(context.TODO(), sip.Uri{User: "test", Host: "localhost"}, nil)
+				require.NoError(t, err)
+				require.NoError(t, d.WaitAnswer(context.TODO(), AnswerOptions{}))
+				require.NoError(t, d.Ack(context.TODO()))
+				return &d.Dialog, d.Bye
+			},
+		},
+	}
+
+	for _, side := range sides {
+		t.Run(side.name, func(t *testing.T) {
+			for _, ctxName := range []string{"OwnContext", "DialogContext"} {
+				t.Run(ctxName, func(t *testing.T) {
+					b := newByeInFlight()
+					d, bye := side.newConfirmed(t, b)
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					if ctxName == "DialogContext" {
+						ctx, cancel = context.WithTimeout(d.Context(), 5*time.Second)
+					}
+					defer cancel()
+
+					sent := make(chan error, 1)
+					go func() { sent <- bye(ctx) }()
+					select {
+					case <-b.inFlight:
+					case <-time.After(5 * time.Second):
+						t.Fatal("the BYE was not sent")
+					}
+					// The BYE reaches the peer as the transaction takes it,
+					// and the dialog ends once the transaction has.
+					select {
+					case <-d.Context().Done():
+					case <-time.After(5 * time.Second):
+						t.Fatal("the session goes on while the BYE is in flight")
+					}
+					assert.Equal(t, sip.DialogStateEnded, d.LoadState())
+
+					close(b.release)
+					select {
+					case err := <-sent:
+						require.NoError(t, err)
+					case <-time.After(5 * time.Second):
+						t.Fatal("Bye did not return after the 200")
+					}
+					assert.Equal(t, sip.DialogStateEnded, d.LoadState())
+				})
+			}
+		})
+	}
 }

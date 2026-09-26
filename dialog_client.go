@@ -498,6 +498,9 @@ func (s *DialogClientSession) Bye(ctx context.Context) error {
 	return s.WriteBye(ctx, bye)
 }
 
+// WriteBye sends bye and waits within ctx for its answer. The dialog ends as
+// soon as bye is passed to its client transaction (RFC 3261 section 15.1.1),
+// whatever the answer.
 func (s *DialogClientSession) WriteBye(ctx context.Context, bye *sip.Request) error {
 	defer s.Close()
 
@@ -519,6 +522,8 @@ func (s *DialogClientSession) WriteBye(ctx context.Context, bye *sip.Request) er
 	}
 	defer s.inviteTx.Terminate() // Terminates INVITE in all cases
 	defer tx.Terminate()         // Terminates current transaction
+	ctx, cancel := s.endOnBye(ctx)
+	defer cancel()
 
 	// Wait 200
 	select {
@@ -526,7 +531,6 @@ func (s *DialogClientSession) WriteBye(ctx context.Context, bye *sip.Request) er
 		if res.StatusCode != 200 {
 			return ErrDialogResponse{res}
 		}
-		s.setState(sip.DialogStateEnded)
 		return nil
 	case <-tx.Done():
 		return tx.Err()

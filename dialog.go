@@ -221,6 +221,26 @@ func (d *Dialog) notifyStates() {
 	}
 }
 
+// endOnBye ends the dialog once our BYE is passed to its client transaction:
+// RFC 3261 section 15.1.1 has the session over from then on, so a request the
+// peer sends meanwhile, such as a re-INVITE, finds the dialog ended. It returns
+// the context to wait for the answer to the BYE within, and its cancel. A ctx
+// that is, or derives from, the dialog's context ends with the dialog, as the
+// dialog's context cancels its children at once; the wait then goes on within
+// ctx's deadline, if it has one, and within the BYE transaction's own timeout.
+func (d *Dialog) endOnBye(ctx context.Context) (context.Context, context.CancelFunc) {
+	live := ctx.Err() == nil
+	d.setState(sip.DialogStateEnded)
+	if !live || ctx.Err() == nil {
+		return ctx, func() {}
+	}
+	waitCtx := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok {
+		return context.WithDeadline(waitCtx, deadline)
+	}
+	return waitCtx, func() {}
+}
+
 // Err returns error that caused dialog termination
 func (d *Dialog) err() error {
 	return context.Cause(d.Context())
