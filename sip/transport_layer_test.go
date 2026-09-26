@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"sync"
 	"testing"
 	"time"
 
@@ -252,27 +251,38 @@ func TestTransportLayerClientConnectionReuse(t *testing.T) {
 		req := NewRequest(OPTIONS, Uri{Host: "localhost", Port: 5066})
 		req.AppendHeader(&ViaHeader{Host: "127.0.0.1", Port: 0})
 		req.SetTransport(transport)
-		connections := sync.Map{}
-		wg := sync.WaitGroup{}
 
-		for i := range 10 {
-			wg.Add(1)
+		// Each request hands its result to the test goroutine, which checks
+		// it: a failed request has no connection to look at.
+		type result struct {
+			conn Connection
+			err  error
+		}
+		const requests = 10
+		results := make(chan result, requests)
+		for range requests {
 			go func(req *Request) {
-				defer wg.Done()
-				conn, err := tp.ClientRequestConnection(context.TODO(), req)
-				t.Log("Created connect", conn.LocalAddr().String())
-				require.NoError(t, err)
-				connections.Store(i, conn)
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				conn, err := tp.ClientRequestConnection(ctx, req)
+				results <- result{conn: conn, err: err}
 			}(req.Clone())
 		}
 
-		wg.Wait()
-		connFirst, _ := connections.Load(0)
-		connections.Range(func(key, value any) bool {
-			assert.Same(t, connFirst, value)
-			assert.Same(t, connFirst.(Connection), value.(Connection))
-			return true
-		})
+		var connFirst Connection
+		for i := range requests {
+			select {
+			case r := <-results:
+				require.NoError(t, r.err)
+				t.Log("Created connect", r.conn.LocalAddr().String())
+				if connFirst == nil {
+					connFirst = r.conn
+				}
+				assert.Same(t, connFirst, r.conn)
+			case <-time.After(10 * time.Second):
+				t.Fatalf("%d of %d requests got no connection", requests-i, requests)
+			}
+		}
 	}
 
 	t.Run("ParallelUDP", func(t *testing.T) {

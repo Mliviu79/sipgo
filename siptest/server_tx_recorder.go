@@ -30,11 +30,12 @@ func NewServerTxRecorder(req *sip.Request) *ServerTxRecorder {
 
 // Result returns sip response. Can be nil if none was processed
 func (r *ServerTxRecorder) Result() []*sip.Response {
-	if len(r.c.msgs) == 0 {
+	msgs := r.c.messages()
+	if len(msgs) == 0 {
 		return nil
 	}
-	resps := make([]*sip.Response, len(r.c.msgs))
-	for i, m := range r.c.msgs {
+	resps := make([]*sip.Response, len(msgs))
+	for i, m := range msgs {
 		resps[i] = m.(*sip.Response).Clone()
 	}
 
