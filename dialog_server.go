@@ -258,6 +258,10 @@ func (s *DialogServerSession) authDigest(chal *digest.Challenge, opts digest.Opt
 // WriteResponse allows passing you custom response
 // NOTE: Make sure you have built response based on dialog.InviteRequest which makes sure
 // that dialog ID do match
+//
+// A 2xx is retransmitted until its ACK is read, which WriteResponse waits for.
+// If no ACK arrives within 64*T1, the dialog is confirmed and ErrDialogAckTimeout
+// is returned: end the session with Bye (RFC 3261 section 13.3.1.4).
 func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 	tx := s.inviteTx
 
@@ -312,12 +316,22 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 	// condition where the ACK is received before we start waiting for it.
 	readStateCh := s.StateRead()
 
+	// Wait now for ACK for our 2xx
+	// https://datatracker.ietf.org/doc/html/rfc3261#section-13.3.1.4
+	//
+	// If the server retransmits the 2xx response for 64*T1 seconds without
+	// receiving an ACK, the dialog is confirmed, but the session SHOULD be
+	// terminated.  This is accomplished with a BYE, as described in Section
+	// 15.
+	//
+	// The deadline is armed once, before the first transmission, so it expires
+	// before the transaction's Timer L, which starts with that transmission.
+	ackTimeout := time.NewTimer(64 * sip.T1)
+	defer ackTimeout.Stop()
+
 	if err := tx.Respond(res); err != nil {
 		return err
 	}
-
-	// Wait now for ACK for our 2xx
-	// https://datatracker.ietf.org/doc/html/rfc3261#section-13.3.1.4
 
 	// We are following RFC 6026, which states that this is TU thing and not Transaction layer.
 	timer := time.NewTimer(sip.T1)
@@ -328,6 +342,15 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 		select {
 		case <-timer.C:
 			if err := tx.Respond(res); err != nil {
+				// Timer L ends the transaction 64*T1 after the first
+				// transmission, just after the deadline. A retransmission
+				// that finds the transaction ended by it is past the
+				// deadline too, and reports the same timeout.
+				select {
+				case <-ackTimeout.C:
+					return s.ackTimedOut()
+				default:
+				}
 				return err
 			}
 			// 2xx response is passed to the transport with an
@@ -336,12 +359,8 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 			//    Section 17).
 			timer.Reset(max(2*sip.T1, sip.T2))
 
-		case <-time.After(64 * sip.T1):
-			// If the server retransmits the 2xx response for 64*T1 seconds without
-			// receiving an ACK, the dialog is confirmed, but the session SHOULD be
-			// terminated.  This is accomplished with a BYE, as described in Section
-			// 15.
-			state = sip.DialogStateConfirmed
+		case <-ackTimeout.C:
+			return s.ackTimedOut()
 		case state = <-readStateCh:
 		}
 	}
@@ -349,6 +368,13 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 		return fmt.Errorf("No ACK received")
 	}
 	return nil
+}
+
+// ackTimedOut confirms a dialog whose 2xx got no ACK within 64*T1 and reports
+// it with ErrDialogAckTimeout, so the caller ends the session with a BYE.
+func (s *DialogServerSession) ackTimedOut() error {
+	s.setState(sip.DialogStateConfirmed)
+	return ErrDialogAckTimeout
 }
 
 func (s *DialogServerSession) Bye(ctx context.Context) error {

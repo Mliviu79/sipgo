@@ -14,6 +14,10 @@ var (
 	ErrDialogDoesNotExists   = errors.New("Call/Transaction Does Not Exist")
 	ErrDialogInviteNoContact = errors.New("no Contact header")
 	ErrDialogInvalidCseq     = errors.New("invalid CSEQ number")
+	// ErrDialogAckTimeout is returned when a 2xx to the INVITE was retransmitted
+	// for 64*T1 without an ACK. The dialog is then confirmed, and the session
+	// should be ended with a BYE (RFC 3261 section 13.3.1.4).
+	ErrDialogAckTimeout = errors.New("no ACK received for 2xx within 64*T1")
 )
 
 type ErrDialogResponse struct {

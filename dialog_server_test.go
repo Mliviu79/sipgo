@@ -5,6 +5,8 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"os"
+	"os/exec"
 	"testing"
 	"time"
 
@@ -334,5 +336,90 @@ func TestDialogServerAnswerAfterCancel(t *testing.T) {
 	case s := <-states:
 		t.Fatalf("state %s reported after the dialog ended", s)
 	default:
+	}
+}
+
+// runInChildProcess runs the calling test again, alone, in a child process of
+// the test binary, and reports true once it has passed there, so the caller
+// returns. In the child it reports false and the caller runs its body. A test
+// that shortens the package-wide SIP timers needs a process of its own:
+// transactions that earlier tests leave running read those timers from their
+// own goroutines, and changing the timers under them is a data race.
+func runInChildProcess(t *testing.T) bool {
+	t.Helper()
+	if os.Getenv("SIPGO_TEST_CHILD") == t.Name() {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0],
+		"-test.run=^"+t.Name()+"$",
+		"-test.count=1",
+		"-test.v",
+		"-test.timeout=60s",
+	)
+	cmd.Env = append(os.Environ(), "SIPGO_TEST_CHILD="+t.Name())
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "child process failed:\n%s", out)
+	return true
+}
+
+// TestDialogServer2xxAckTimeout answers with a 2xx that is never acknowledged.
+// RFC 3261 section 13.3.1.4 bounds the wait: after retransmitting the 2xx for
+// 64*T1 the dialog is confirmed, and the session is to be ended with a BYE.
+// The bound is WriteResponse's own, whether the transaction outlives it or, as
+// RFC 6026 section 8.7 has it, ends with Timer L at the same moment.
+func TestDialogServer2xxAckTimeout(t *testing.T) {
+	if runInChildProcess(t) {
+		return
+	}
+	sip.T1, sip.T2 = 10*time.Millisecond, 40*time.Millisecond
+
+	ua, _ := NewUA()
+	defer ua.Close()
+	cli, _ := NewClient(ua)
+
+	uasContact := sip.ContactHeader{
+		Address: sip.Uri{User: "test", Host: "127.0.0.200", Port: 5099},
+	}
+	dialogSrv := NewDialogServerCache(cli, uasContact)
+
+	for _, tc := range []struct {
+		name   string
+		timerL time.Duration
+	}{
+		{name: "TransactionOutlivesWait", timerL: time.Minute},
+		{name: "TimerLEndsTransaction", timerL: 64 * sip.T1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sip.Timer_L = tc.timerL
+
+			invite, _, _ := createTestInvite(t, "sip:uas@127.0.0.1", "udp", "127.0.0.1:5090")
+			invite.AppendHeader(&sip.ContactHeader{Address: sip.Uri{Host: "uas", Port: 1234}})
+			tx := siptest.NewServerTxRecorder(invite)
+			defer tx.Terminate()
+
+			d, err := dialogSrv.ReadInvite(invite, tx)
+			require.NoError(t, err)
+			defer d.Close()
+
+			res200 := sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil)
+			start := time.Now()
+			answered := make(chan error, 1)
+			go func() { answered <- d.WriteResponse(res200) }()
+
+			select {
+			case err := <-answered:
+				require.ErrorIs(t, err, ErrDialogAckTimeout)
+			case <-time.After(5 * time.Second):
+				// Ending the transaction fails the next retransmission, which
+				// returns WriteResponse.
+				tx.Terminate()
+				t.Fatal("WriteResponse still waits for the ACK long after 64*T1")
+			}
+			assert.GreaterOrEqual(t, time.Since(start), 64*sip.T1)
+			assert.Equal(t, sip.DialogStateConfirmed, d.LoadState())
+			assert.Greater(t, len(tx.Result()), 1, "the 2xx is retransmitted while waiting")
+		})
 	}
 }
