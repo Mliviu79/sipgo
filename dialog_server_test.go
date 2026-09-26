@@ -386,6 +386,7 @@ func TestDialogServer2xxAckTimeout(t *testing.T) {
 	if runInChildProcess(t) {
 		return
 	}
+	restoreSIPTimers(t)
 	sip.T1, sip.T2 = 10*time.Millisecond, 40*time.Millisecond
 
 	ua, _ := NewUA()
@@ -473,6 +474,7 @@ func TestDialogServer2xxRetransmissionInterval(t *testing.T) {
 	if runInChildProcess(t) {
 		return
 	}
+	restoreSIPTimers(t)
 	sip.T1, sip.T2 = 10*time.Millisecond, time.Second
 
 	ua, _ := NewUA()

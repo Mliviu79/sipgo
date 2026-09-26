@@ -15,6 +15,10 @@ import (
 )
 
 func TestClientTransactionInviteFSM(t *testing.T) {
+	if runInChildProcess(t) {
+		return
+	}
+	restoreTimers(t)
 	// make things fast
 	SetTimers(1*time.Millisecond, 1*time.Millisecond, 1*time.Millisecond)
 	req, _, _ := testCreateInvite(t, "sip:127.0.0.99:5060", "udp", "127.0.0.2:5060")
@@ -51,7 +55,11 @@ func TestClientTransactionInviteFSM(t *testing.T) {
 	require.NoError(t, compareFunctions(tx.currentFsmState(), tx.inviteStateAccepted))
 
 	// COMPLETED STATE
-	time.Sleep(Timer_M * 2)
+	select {
+	case <-tx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("transaction did not terminate on Timer M")
+	}
 	require.NoError(t, compareFunctions(tx.currentFsmState(), tx.inviteStateTerminated))
 
 	// res200 := NewResponseFromRequest(req, StatusOK, "OK", nil)

@@ -110,10 +110,54 @@ func TestMain(m *testing.M) {
 	}
 	slog.SetLogLoggerLevel(lvl)
 
-	m.Run()
+	timers := loadSIPTimers()
+	code := m.Run()
+	if got := loadSIPTimers(); got != timers {
+		fmt.Fprintf(os.Stderr, "the tests left the SIP timers changed: %+v, want %+v\n", got, timers)
+		code = 1
+	}
+	os.Exit(code)
+}
+
+// sipTimers are the package-wide timers of package sip, which transactions
+// read from their own goroutines.
+type sipTimers struct {
+	t1, t2, t4                               time.Duration
+	a, b, d, e, f, g, h, i, j, k, l, m, t1xx time.Duration
+}
+
+func loadSIPTimers() sipTimers {
+	return sipTimers{
+		t1: sip.T1, t2: sip.T2, t4: sip.T4,
+		a: sip.Timer_A, b: sip.Timer_B, d: sip.Timer_D, e: sip.Timer_E,
+		f: sip.Timer_F, g: sip.Timer_G, h: sip.Timer_H, i: sip.Timer_I,
+		j: sip.Timer_J, k: sip.Timer_K, l: sip.Timer_L, m: sip.Timer_M,
+		t1xx: sip.Timer_1xx,
+	}
+}
+
+func (s sipTimers) store() {
+	sip.T1, sip.T2, sip.T4 = s.t1, s.t2, s.t4
+	sip.Timer_A, sip.Timer_B, sip.Timer_D, sip.Timer_E = s.a, s.b, s.d, s.e
+	sip.Timer_F, sip.Timer_G, sip.Timer_H, sip.Timer_I = s.f, s.g, s.h, s.i
+	sip.Timer_J, sip.Timer_K, sip.Timer_L, sip.Timer_M = s.j, s.k, s.l, s.m
+	sip.Timer_1xx = s.t1xx
+}
+
+// restoreSIPTimers has the package-wide SIP timers restored once t has
+// finished and has ended the transactions it started. A test that changes them
+// calls it first, and runs alone in a child process (runInChildProcess), where
+// no transaction of another test reads them.
+func restoreSIPTimers(t *testing.T) {
+	saved := loadSIPTimers()
+	t.Cleanup(saved.store)
 }
 
 func TestUDPUAS(t *testing.T) {
+	if runInChildProcess(t) {
+		return
+	}
+	restoreSIPTimers(t)
 	// Set this timer so that we avoid long retransmissions
 	sip.Timer_J = 10 * time.Millisecond
 	sip.Timer_L = 10 * time.Millisecond
@@ -211,7 +255,11 @@ func TestUDPUAS(t *testing.T) {
 	// Check are all server transaction dead
 	for _, tx := range serverTxs {
 		t.Logf("Waiting tx %q termination", tx.(*sip.ServerTx).Key())
-		<-tx.Done()
+		select {
+		case <-tx.Done():
+		case <-time.After(5 * time.Second):
+			t.Fatalf("tx %q did not terminate", tx.(*sip.ServerTx).Key())
+		}
 	}
 }
 

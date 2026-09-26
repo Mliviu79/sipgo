@@ -161,7 +161,6 @@ func TestServerTransactionFSMInvite(t *testing.T) {
 	incoming := bytes.NewBuffer([]byte{})
 	outgoing := bytes.NewBuffer([]byte{})
 	t.Run("InviteCancel", func(t *testing.T) {
-		Timer_I = 10 * time.Millisecond
 		conn := &UDPConnection{
 			PacketConn: &fakes.UDPConn{
 				Reader:  incoming,
@@ -171,6 +170,11 @@ func TestServerTransactionFSMInvite(t *testing.T) {
 		tx := NewServerTx("123", req, conn, slog.Default())
 		err := tx.Init()
 		require.NoError(t, err)
+		// Timer I is set on the transaction itself, so no package-level timer
+		// is changed.
+		tx.mu.Lock()
+		tx.timer_i_time = 10 * time.Millisecond
+		tx.mu.Unlock()
 
 		// We received Cancel while dealing with resposn
 		res100 := NewResponseFromRequest(req, StatusTrying, "Trying", nil)
@@ -193,9 +197,12 @@ func TestServerTransactionFSMInvite(t *testing.T) {
 		ack.AppendHeader(HeaderClone(req.CallID()))
 		require.NoError(t, tx.Receive(ack))
 
-		require.Eventually(t, func() bool {
-			return compareFunctions(tx.currentFsmState(), tx.inviteStateTerminated) == nil
-		}, 10*Timer_I, Timer_I)
+		select {
+		case <-tx.Done():
+		case <-time.After(5 * time.Second):
+			t.Fatal("transaction did not terminate on Timer I")
+		}
+		require.NoError(t, compareFunctions(tx.currentFsmState(), tx.inviteStateTerminated))
 	})
 }
 
