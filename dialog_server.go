@@ -315,6 +315,17 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 	// Register dialog state read channel before transmitting 200 OK. This prevents a race
 	// condition where the ACK is received before we start waiting for it.
 	readStateCh := s.StateRead()
+	// The state is loaded after the read is registered, so a change made in
+	// between, such as the dialog ending, is not missed. An ended dialog gets
+	// no 2xx. When a CANCEL or the end of the transaction ended it, the
+	// transaction's error says so, as in the check above.
+	state := s.LoadState()
+	if state == sip.DialogStateEnded {
+		if err := tx.Err(); err != nil {
+			return err
+		}
+		return fmt.Errorf("No ACK received")
+	}
 
 	// Wait now for ACK for our 2xx
 	// https://datatracker.ietf.org/doc/html/rfc3261#section-13.3.1.4
@@ -338,7 +349,6 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
 
-	state := sip.DialogStateEstablished
 	for state == sip.DialogStateEstablished {
 		select {
 		case <-timer.C:

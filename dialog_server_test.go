@@ -532,3 +532,52 @@ func TestDialogServer2xxRetransmissionInterval(t *testing.T) {
 		assert.Less(t, interval, sip.T2/2, "retransmission %d", i+1)
 	}
 }
+
+// TestDialogServerEndedWhileAnswering ends the dialog once WriteResponse has
+// established it and before WriteResponse starts waiting for the ACK, as a BYE
+// read on another goroutine can before that BYE ends the INVITE transaction.
+// WriteResponse must see the end: it sends no 2xx for the ended dialog and
+// returns at once, instead of waiting for an ACK until 64*T1.
+func TestDialogServerEndedWhileAnswering(t *testing.T) {
+	ua, _ := NewUA()
+	defer ua.Close()
+	cli, _ := NewClient(ua)
+
+	uasContact := sip.ContactHeader{
+		Address: sip.Uri{User: "test", Host: "127.0.0.200", Port: 5099},
+	}
+	dialogSrv := NewDialogServerCache(cli, uasContact)
+
+	invite, _, _ := createTestInvite(t, "sip:uas@127.0.0.1", "udp", "127.0.0.1:5090")
+	invite.AppendHeader(&sip.ContactHeader{Address: sip.Uri{Host: "uas", Port: 1234}})
+	key, err := sip.ServerTxKeyMake(invite)
+	require.NoError(t, err)
+	conn := &sendTimesConn{wrote: make(chan struct{}, 1)}
+	tx := sip.NewServerTx(key, invite, conn, slog.Default())
+	require.NoError(t, tx.Init())
+	defer tx.Terminate()
+
+	d, err := dialogSrv.ReadInvite(invite, tx)
+	require.NoError(t, err)
+	defer d.Close()
+
+	// Called inside WriteResponse's move to Established, so the dialog ends
+	// before WriteResponse registers for the ACK.
+	d.OnState(func(s sip.DialogState) {
+		if s == sip.DialogStateEstablished {
+			d.setState(sip.DialogStateEnded)
+		}
+	})
+
+	res200 := sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil)
+	answered := make(chan error, 1)
+	go func() { answered <- d.WriteResponse(res200) }()
+	select {
+	case err := <-answered:
+		require.Error(t, err, "the dialog ended before its 2xx was acknowledged")
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteResponse waits for the ACK of a dialog that has ended")
+	}
+	assert.Empty(t, conn.sendTimes(), "a 2xx was sent for a dialog that has ended")
+	assert.Equal(t, sip.DialogStateEnded, d.LoadState())
+}
