@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"testing"
@@ -287,7 +288,14 @@ func TestTransportLayerClientConnectionReuse(t *testing.T) {
 				if err != nil {
 					break
 				}
-				go func() { conn.Read([]byte{}) }()
+				// Hold the connection until the client closes it. A dropped
+				// one is closed by its finalizer once garbage collected, and
+				// the client then takes it out of its pool, so a later request
+				// in the test would dial a new one.
+				go func() {
+					defer conn.Close()
+					_, _ = io.Copy(io.Discard, conn)
+				}()
 			}
 		}()
 		testParallel(t, "TCP")
