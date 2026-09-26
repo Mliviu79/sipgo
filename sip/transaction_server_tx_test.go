@@ -116,12 +116,43 @@ func TestServerTransactionNonInviteFSM(t *testing.T) {
 		// passing 200 response
 		err = tx.Respond(NewResponseFromRequest(req, 200, "OK", nil))
 		require.NoError(t, err)
-		require.NoError(t, compareFunctions(tx.currentFsmState(), tx.stateCompleted))
 
-		// timer J should be zero
+		// timer J should be zero, so Completed ends as soon as the timer
+		// fires and the transaction terminates without any further input.
 		require.Zero(t, tx.timer_j_time)
-		require.Zero(t, <-tx.done)
+		select {
+		case <-tx.Done():
+		case <-time.After(5 * time.Second):
+			t.Fatal("transaction did not terminate on timer J")
+		}
+		require.NoError(t, compareFunctions(tx.currentFsmState(), tx.stateTerminated))
+		require.ErrorIs(t, tx.Err(), ErrTransactionTerminated)
 	})
+}
+
+// TestServerTransactionRespondReliableFinal sends the final response to a
+// non-INVITE request over a reliable transport. Timer J is zero there, so the
+// transaction terminates as soon as the response is sent, and Respond must
+// still report the send as done. The termination runs on the timer's own
+// goroutine and only rarely comes first, so the exchange is repeated.
+func TestServerTransactionRespondReliableFinal(t *testing.T) {
+	conn := &UDPConnection{
+		PacketConn: &fakes.UDPConn{
+			Writers: map[string]io.Writer{"127.0.0.1:5060": io.Discard},
+		},
+	}
+	for i := range 2000 {
+		req := testCreateRequest(t, "OPTIONS", "sip:example.com", "TCP", "127.0.0.1:5060")
+		tx := NewServerTx("123", req, conn, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		require.NoError(t, tx.Init())
+
+		require.NoError(t, tx.Respond(NewResponseFromRequest(req, 200, "OK", nil)), "exchange %d", i)
+		select {
+		case <-tx.Done():
+		case <-time.After(5 * time.Second):
+			t.Fatalf("exchange %d: transaction did not terminate on timer J", i)
+		}
+	}
 }
 
 func TestServerTransactionFSMInvite(t *testing.T) {

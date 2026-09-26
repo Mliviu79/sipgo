@@ -122,9 +122,16 @@ func (tx *ServerTx) Respond(res *Response) error {
 	default:
 		input = server_input_user_300_plus
 	}
-	tx.spinFsmWithResponse(input, res)
-	// In case of termination or some error
-	return tx.Err()
+	// In case of termination or some error. The error is read under the same
+	// hold of the state lock as the send: over a reliable transport a final
+	// response to a non-INVITE request starts Timer J at zero, and the
+	// termination it fires must not be reported as a failure of this send.
+	tx.fsmMu.Lock()
+	tx.fsmResp = res
+	tx.spinFsmUnsafe(input)
+	err := tx.fsmErr
+	tx.fsmMu.Unlock()
+	return err
 }
 
 // respondUnlessFinalized sends res, a 300+ response, only when no final
