@@ -218,7 +218,7 @@ func TestTransportLayerClientConnectionReuse(t *testing.T) {
 		conn2, err := tp.ClientRequestConnection(context.TODO(), req)
 		require.NoError(t, err)
 
-		require.Equal(t, conn, conn2)
+		require.Same(t, conn, conn2)
 	})
 
 	t.Run("WithClientHostPort", func(t *testing.T) {
@@ -235,7 +235,7 @@ func TestTransportLayerClientConnectionReuse(t *testing.T) {
 
 		conn2, err := tp.ClientRequestConnection(context.TODO(), req)
 		require.NoError(t, err)
-		require.Equal(t, conn, conn2)
+		require.Same(t, conn, conn2)
 
 		// Now same destination but forcing port
 		req = NewRequest(OPTIONS, Uri{Host: "localhost", Port: 5066})
@@ -244,7 +244,7 @@ func TestTransportLayerClientConnectionReuse(t *testing.T) {
 		conn3, err := tp.ClientRequestConnection(context.TODO(), req)
 
 		require.NoError(t, err)
-		require.NotEqual(t, conn, conn3)
+		require.NotSame(t, conn, conn3)
 	})
 
 	testParallel := func(t *testing.T, transport string) {
@@ -268,8 +268,8 @@ func TestTransportLayerClientConnectionReuse(t *testing.T) {
 		wg.Wait()
 		connFirst, _ := connections.Load(0)
 		connections.Range(func(key, value any) bool {
-			assert.Equal(t, connFirst, value)
-			assert.Equal(t, connFirst.(Connection), value.(Connection))
+			assert.Same(t, connFirst, value)
+			assert.Same(t, connFirst.(Connection), value.(Connection))
 			return true
 		})
 	}
@@ -318,7 +318,7 @@ func TestTransportLayerClientConnectionNoReuse(t *testing.T) {
 		conn2, err := tp.ClientRequestConnection(context.TODO(), req)
 		require.NoError(t, err)
 
-		require.NotEqual(t, conn, conn2)
+		require.NotSame(t, conn, conn2)
 	})
 
 	t.Run("WithClientHostPort", func(t *testing.T) {
@@ -335,7 +335,7 @@ func TestTransportLayerClientConnectionNoReuse(t *testing.T) {
 
 		conn2, err := tp.ClientRequestConnection(context.TODO(), req)
 		require.NoError(t, err)
-		require.Equal(t, conn, conn2)
+		require.Same(t, conn, conn2)
 
 		// Now same destination but forcing port
 		req = NewRequest(OPTIONS, Uri{Host: "localhost", Port: 5066})
@@ -344,7 +344,7 @@ func TestTransportLayerClientConnectionNoReuse(t *testing.T) {
 		conn3, err := tp.ClientRequestConnection(context.TODO(), req)
 		require.NoError(t, err)
 
-		require.NotEqual(t, conn, conn3)
+		require.NotSame(t, conn, conn3)
 	})
 }
 
