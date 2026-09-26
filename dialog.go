@@ -92,11 +92,19 @@ func (d *Dialog) InitWithState(s sip.DialogState) {
 	d.state.Store(int32(s))
 }
 
+// setState moves the dialog to s. Ended is final: a dialog that has ended
+// takes no other state, so a request handled late, such as an ACK read after
+// the BYE that followed it, cannot bring it back. A transition that changes
+// nothing, repeated or refused, calls no state callback.
 func (d *Dialog) setState(s sip.DialogState) {
-	old := d.state.Swap(int32(s))
-	if old == int32(s) {
-		// Safety
-		return
+	for {
+		old := d.state.Load()
+		if old == int32(s) || old == int32(sip.DialogStateEnded) {
+			return
+		}
+		if d.state.CompareAndSwap(old, int32(s)) {
+			break
+		}
 	}
 
 	if s == sip.DialogStateEnded {

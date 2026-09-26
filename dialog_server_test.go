@@ -218,3 +218,121 @@ func TestDialogServer2xxRetransmission(t *testing.T) {
 	resps := tx.Result()
 	require.Len(t, resps, 2)
 }
+
+// TestDialogServerAckAfterBye reads the ACK to our 2xx after the BYE that the
+// peer sent behind it. Requests are handled on their own goroutines, so the
+// BYE can be read first. The dialog has ended by then, and the late ACK must
+// not confirm it again or report a state change.
+func TestDialogServerAckAfterBye(t *testing.T) {
+	ua, _ := NewUA()
+	defer ua.Close()
+	cli, _ := NewClient(ua)
+
+	uasContact := sip.ContactHeader{
+		Address: sip.Uri{User: "test", Host: "127.0.0.200", Port: 5099},
+	}
+	dialogSrv := NewDialogServerCache(cli, uasContact)
+
+	invite, _, _ := createTestInvite(t, "sip:uas@127.0.0.1", "udp", "127.0.0.1:5090")
+	invite.AppendHeader(&sip.ContactHeader{Address: sip.Uri{Host: "uas", Port: 1234}})
+
+	newConn := func() *sip.UDPConnection {
+		return &sip.UDPConnection{
+			PacketConn: &fakes.UDPConn{
+				Writers: map[string]io.Writer{
+					"127.0.0.1:5090": bytes.NewBuffer(make([]byte, 0)),
+				},
+			},
+		}
+	}
+	tx := sip.NewServerTx("test", invite, newConn(), slog.Default())
+	require.NoError(t, tx.Init())
+	defer tx.Terminate()
+
+	d, err := dialogSrv.ReadInvite(invite, tx)
+	require.NoError(t, err)
+	defer d.Close()
+
+	states := d.StateRead()
+	res200 := sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil)
+	answered := make(chan error, 1)
+	go func() { answered <- d.WriteResponse(res200) }()
+
+	readState := func() sip.DialogState {
+		t.Helper()
+		select {
+		case s := <-states:
+			return s
+		case <-time.After(5 * time.Second):
+			t.Fatal("no dialog state change")
+			return 0
+		}
+	}
+	require.Equal(t, sip.DialogStateEstablished, readState())
+
+	bye := newByeRequestUAC(invite, res200, nil)
+	byeTx := sip.NewServerTx("test-bye", bye, newConn(), slog.Default())
+	require.NoError(t, byeTx.Init())
+	require.NoError(t, d.ReadBye(bye, byeTx))
+	require.Equal(t, sip.DialogStateEnded, readState())
+
+	select {
+	case err := <-answered:
+		require.Error(t, err, "the dialog ended before its 2xx was acknowledged")
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteResponse did not return after the dialog ended")
+	}
+
+	ack := newAckRequestUAC(d.InviteRequest, res200, nil)
+	require.NoError(t, d.ReadAck(ack, tx))
+	assert.Equal(t, sip.DialogStateEnded, d.LoadState())
+	select {
+	case s := <-states:
+		t.Fatalf("state %s reported after the dialog ended", s)
+	default:
+	}
+}
+
+// TestDialogServerAnswerAfterCancel answers 200 to an INVITE whose CANCEL was
+// read just before. The CANCEL ended the dialog, and the answer that lost the
+// race must fail without establishing it again.
+func TestDialogServerAnswerAfterCancel(t *testing.T) {
+	ua, _ := NewUA()
+	defer ua.Close()
+	cli, _ := NewClient(ua)
+
+	uasContact := sip.ContactHeader{
+		Address: sip.Uri{User: "test", Host: "127.0.0.200", Port: 5099},
+	}
+	dialogSrv := NewDialogServerCache(cli, uasContact)
+
+	invite, _, _ := createTestInvite(t, "sip:uas@127.0.0.1", "udp", "127.0.0.1:5090")
+	invite.AppendHeader(&sip.ContactHeader{Address: sip.Uri{Host: "uas", Port: 1234}})
+	conn := &sip.UDPConnection{
+		PacketConn: &fakes.UDPConn{
+			Writers: map[string]io.Writer{
+				"127.0.0.1:5090": bytes.NewBuffer(make([]byte, 0)),
+			},
+		},
+	}
+	tx := sip.NewServerTx("test", invite, conn, slog.Default())
+	require.NoError(t, tx.Init())
+	defer tx.Terminate()
+
+	d, err := dialogSrv.ReadInvite(invite, tx)
+	require.NoError(t, err)
+	defer d.Close()
+
+	require.NoError(t, tx.Receive(newCancelRequest(invite)))
+	require.Equal(t, sip.DialogStateEnded, d.LoadState())
+
+	states := d.StateRead()
+	err = d.WriteResponse(sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil))
+	require.ErrorIs(t, err, sip.ErrTransactionCanceled)
+	assert.Equal(t, sip.DialogStateEnded, d.LoadState())
+	select {
+	case s := <-states:
+		t.Fatalf("state %s reported after the dialog ended", s)
+	default:
+	}
+}

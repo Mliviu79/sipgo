@@ -444,6 +444,54 @@ func TestDialogClientACKRetransmission(t *testing.T) {
 	assert.EqualValues(t, 3, atomic.LoadInt32(&acks))
 }
 
+// TestDialogClientByeBeforeAckReturns has the peer's BYE read while our ACK is
+// still being written. The peer sends that BYE as soon as the ACK reaches it,
+// and requests are handled on their own goroutines, so the BYE can end the
+// dialog before WriteAck marks it confirmed. The ended dialog must stay ended.
+func TestDialogClientByeBeforeAckReturns(t *testing.T) {
+	var d *DialogClientSession
+	client := testClient(t, func(req *sip.Request) *sip.Response {
+		if req.IsAck() {
+			bye := newByeRequestUAC(d.InviteRequest, d.InviteResponse, nil)
+			var params sip.HeaderParams
+			params.Add("branch", sip.GenerateBranch())
+			bye.PrependHeader(&sip.ViaHeader{
+				ProtocolName:    "SIP",
+				ProtocolVersion: "2.0",
+				Transport:       "UDP",
+				Host:            "127.0.0.1",
+				Port:            5090,
+				Params:          params,
+			})
+			require.NoError(t, d.ReadBye(bye, siptest.NewServerTxRecorder(bye)))
+		}
+		return sip.NewResponseFromRequest(req, 200, "OK", nil)
+	})
+
+	dua := DialogUA{
+		Client: client,
+	}
+	var err error
+	d, err = dua.Invite(context.TODO(), sip.Uri{User: "test", Host: "localhost"}, nil)
+	require.NoError(t, err)
+	require.NoError(t, d.WaitAnswer(context.TODO(), AnswerOptions{}))
+
+	states := d.StateRead()
+	require.NoError(t, d.Ack(context.TODO()))
+	assert.Equal(t, sip.DialogStateEnded, d.LoadState())
+	select {
+	case s := <-states:
+		require.Equal(t, sip.DialogStateEnded, s)
+	default:
+		t.Fatal("the BYE did not end the dialog")
+	}
+	select {
+	case s := <-states:
+		t.Fatalf("state %s reported after the dialog ended", s)
+	default:
+	}
+}
+
 func BenchmarkDialogDo(b *testing.B) {
 	ua, _ := NewUA()
 	cli, _ := NewClient(ua)
