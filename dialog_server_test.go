@@ -802,3 +802,42 @@ func TestDialogServerByeOutOfOrder(t *testing.T) {
 	assert.Equal(t, sip.StatusOK, answers[0].StatusCode)
 	assert.Equal(t, sip.DialogStateEnded, d.LoadState())
 }
+
+// TestDialogServerByeAnswerFails reads a BYE whose 200 cannot be sent, as its
+// transaction has ended. ReadBye closes the dialog and terminates its INVITE
+// transaction either way, so the dialog has ended too: its state and its
+// context say so, and ReadBye reports the failed answer.
+func TestDialogServerByeAnswerFails(t *testing.T) {
+	ua, _ := NewUA()
+	defer ua.Close()
+	cli, _ := NewClient(ua)
+
+	uasContact := sip.ContactHeader{
+		Address: sip.Uri{User: "test", Host: "127.0.0.200", Port: 5099},
+	}
+	dialogSrv := NewDialogServerCache(cli, uasContact)
+
+	invite, _, _ := createTestInvite(t, "sip:uas@127.0.0.1", "udp", "127.0.0.1:5090")
+	invite.AppendHeader(&sip.ContactHeader{Address: sip.Uri{Host: "uas", Port: 1234}})
+	tx := siptest.NewServerTxRecorder(invite)
+	defer tx.Terminate()
+
+	d, err := dialogSrv.ReadInvite(invite, tx)
+	require.NoError(t, err)
+	defer d.Close()
+	res200 := sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil)
+	d.setState(sip.DialogStateConfirmed)
+
+	bye := newInDialogRequest(invite, res200, sip.BYE, invite.CSeq().SeqNo+1)
+	byeTx := siptest.NewServerTxRecorder(bye)
+	byeTx.Terminate()
+	require.ErrorIs(t, d.ReadBye(bye, byeTx), sip.ErrTransactionTerminated)
+
+	assert.Equal(t, sip.DialogStateEnded, d.LoadState())
+	select {
+	case <-d.Context().Done():
+	default:
+		t.Fatal("the context of the dialog the BYE ended is not done")
+	}
+	assert.Nil(t, dialogSrv.loadDialog(d.ID), "the dialog is still cached")
+}
