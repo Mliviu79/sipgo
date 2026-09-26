@@ -228,10 +228,11 @@ func TestParserStreamMessage(t *testing.T) {
 			Name:  "before body",
 			Split: []int{704}, Skip: 4,
 		},
-		// completely random split (try a few times)
-		{Split: []int{rand.IntN(len(data))}},
-		{Split: []int{rand.IntN(len(data))}},
-		{Split: []int{rand.IntN(len(data))}},
+		// completely random split (try a few times). An empty first part
+		// holds no message, partial or whole, so a split is never at 0.
+		{Split: []int{1 + rand.IntN(len(data)-1)}},
+		{Split: []int{1 + rand.IntN(len(data)-1)}},
+		{Split: []int{1 + rand.IntN(len(data)-1)}},
 	} {
 		name := c.Name
 		if name == "" {
