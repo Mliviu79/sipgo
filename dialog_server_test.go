@@ -950,3 +950,100 @@ func TestDialogServerByeWaitsForAck(t *testing.T) {
 		}
 	})
 }
+
+// TestDialogServerRespondAfterAnswer writes responses to a dialog already
+// answered with a 2xx and confirmed. A 2xx is only ever sent again as a
+// retransmission of the one that answered the INVITE, so the same 2xx is sent
+// again and any other response is refused: nothing is sent, the 2xx the dialog
+// was answered with stays its answer, and the dialog stays confirmed.
+func TestDialogServerRespondAfterAnswer(t *testing.T) {
+	newConfirmed := func(t *testing.T) (*DialogServerSession, *sendTimesConn, *sip.Response) {
+		ua, _ := NewUA()
+		t.Cleanup(func() { ua.Close() })
+		cli, _ := NewClient(ua)
+		dialogSrv := NewDialogServerCache(cli, sip.ContactHeader{
+			Address: sip.Uri{User: "test", Host: "127.0.0.200", Port: 5099},
+		})
+
+		invite, _, _ := createTestInvite(t, "sip:uas@127.0.0.1", "udp", "127.0.0.1:5090")
+		invite.AppendHeader(&sip.ContactHeader{Address: sip.Uri{Host: "uas", Port: 1234}})
+		key, err := sip.ServerTxKeyMake(invite)
+		require.NoError(t, err)
+		conn := &sendTimesConn{wrote: make(chan struct{}, 1)}
+		tx := sip.NewServerTx(key, invite, conn, slog.Default())
+		require.NoError(t, tx.Init())
+		t.Cleanup(tx.Terminate)
+
+		d, err := dialogSrv.ReadInvite(invite, tx)
+		require.NoError(t, err)
+		t.Cleanup(func() { d.Close() })
+
+		res200 := sip.NewSDPResponseFromRequest(d.InviteRequest, []byte("v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n"))
+		answered := make(chan error, 1)
+		go func() { answered <- d.WriteResponse(res200) }()
+		select {
+		case <-conn.wrote:
+		case err := <-answered:
+			t.Fatalf("WriteResponse returned %v before sending the 2xx", err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("the 2xx was not sent")
+		}
+		require.NoError(t, d.ReadAck(newAckRequestUAC(d.InviteRequest, res200, nil), tx))
+		select {
+		case err := <-answered:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("WriteResponse did not return after the ACK")
+		}
+		return d, conn, res200
+	}
+
+	// writeResponse writes res and returns its result, bounded.
+	writeResponse := func(t *testing.T, d *DialogServerSession, res *sip.Response) error {
+		t.Helper()
+		written := make(chan error, 1)
+		go func() { written <- d.WriteResponse(res) }()
+		select {
+		case err := <-written:
+			return err
+		case <-time.After(5 * time.Second):
+			t.Fatalf("WriteResponse of %s did not return", res.StartLine())
+			return nil
+		}
+	}
+
+	t.Run("Same2xx", func(t *testing.T) {
+		d, conn, res200 := newConfirmed(t)
+		sent := len(conn.sendTimes())
+		// Built anew from the INVITE, it is the same 2xx.
+		again := sip.NewSDPResponseFromRequest(d.InviteRequest, res200.Body())
+		require.NoError(t, writeResponse(t, d, again))
+		assert.Len(t, conn.sendTimes(), sent+1, "the 2xx was not sent again")
+		assert.Equal(t, sip.DialogStateConfirmed, d.LoadState())
+	})
+
+	refused := []struct {
+		name string
+		res  func(d *DialogServerSession) *sip.Response
+	}{
+		{name: "Other2xx", res: func(d *DialogServerSession) *sip.Response {
+			return sip.NewSDPResponseFromRequest(d.InviteRequest, []byte("v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\n"))
+		}},
+		{name: "Final", res: func(d *DialogServerSession) *sip.Response {
+			return sip.NewResponseFromRequest(d.InviteRequest, sip.StatusBusyHere, "Busy Here", nil)
+		}},
+		{name: "Provisional", res: func(d *DialogServerSession) *sip.Response {
+			return sip.NewResponseFromRequest(d.InviteRequest, sip.StatusRinging, "Ringing", nil)
+		}},
+	}
+	for _, tc := range refused {
+		t.Run(tc.name, func(t *testing.T) {
+			d, conn, res200 := newConfirmed(t)
+			sent := len(conn.sendTimes())
+			require.ErrorIs(t, writeResponse(t, d, tc.res(d)), ErrDialogAlreadyAnswered)
+			assert.Len(t, conn.sendTimes(), sent, "a 2xx was sent")
+			assert.Same(t, res200, d.InviteResponse)
+			assert.Equal(t, sip.DialogStateConfirmed, d.LoadState())
+		})
+	}
+}

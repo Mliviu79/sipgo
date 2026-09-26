@@ -22,6 +22,9 @@ var (
 	// ErrDialogEndedBeforeAck is returned when the dialog ends before the ACK
 	// to its 2xx is read, for example on a BYE.
 	ErrDialogEndedBeforeAck = errors.New("No ACK received")
+	// ErrDialogAlreadyAnswered is returned for a response to a dialog already
+	// answered with a 2xx, other than that 2xx sent again.
+	ErrDialogAlreadyAnswered = errors.New("dialog already answered with a different 2xx")
 )
 
 type ErrDialogResponse struct {

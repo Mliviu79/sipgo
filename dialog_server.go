@@ -268,13 +268,22 @@ func (s *DialogServerSession) authDigest(chal *digest.Challenge, opts digest.Opt
 // is returned: end the session with Bye (RFC 3261 section 13.3.1.4). If the
 // dialog ends first, ErrDialogEndedBeforeAck is returned. If the transaction
 // takes no 2xx, as after a CANCEL, its error is returned and the dialog the 2xx
-// established ends.
+// established ends. Once the dialog is answered with a 2xx, that 2xx may be
+// written again, which sends it again, and any other response is refused with
+// ErrDialogAlreadyAnswered.
 func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 	tx := s.inviteTx
 
 	if res.Contact() == nil {
 		// Add our default contact header
 		res.AppendHeader(&s.ua.ContactHDR)
+	}
+
+	// The INVITE takes one final response. Once it is a 2xx, that 2xx is
+	// only ever sent again, as a retransmission (RFC 3261 section 13.3.1.4):
+	// any other response is refused, and the 2xx stays the dialog's answer.
+	if prev := s.Dialog.InviteResponse; prev != nil && prev.IsSuccess() && prev != res && prev.String() != res.String() {
+		return ErrDialogAlreadyAnswered
 	}
 
 	s.Dialog.InviteResponse = res
