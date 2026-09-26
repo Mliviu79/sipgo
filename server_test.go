@@ -357,7 +357,11 @@ func TestTCPUAS(t *testing.T) {
 	// Check are all server transaction dead
 	for _, tx := range serverTxs {
 		t.Logf("Waiting tx %q termination", tx.(*sip.ServerTx).Key())
-		<-tx.Done()
+		select {
+		case <-tx.Done():
+		case <-time.After(5 * time.Second):
+			t.Fatalf("tx %q did not terminate", tx.(*sip.ServerTx).Key())
+		}
 	}
 }
 

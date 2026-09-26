@@ -106,6 +106,10 @@ func TestIntegrationClientServer(t *testing.T) {
 		shutdown()
 		wg.Wait()
 	})
+	// Handlers run off the test goroutine, so they report their failures
+	// here for the test goroutine.
+	errs := newHandlerErrors()
+	t.Cleanup(func() { errs.check(t) })
 
 	for _, tc := range testCases {
 		ua, _ := NewUA()
@@ -116,10 +120,10 @@ func TestIntegrationClientServer(t *testing.T) {
 		require.NoError(t, err)
 
 		srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
-			t.Log("Invite received")
 			res := sip.NewResponseFromRequest(req, 200, "OK", nil)
 			if err := tx.Respond(res); err != nil {
-				t.Fatal(err)
+				errs.report("respond 200: %w", err)
+				return
 			}
 			<-tx.Done()
 		})
@@ -145,7 +149,11 @@ func TestIntegrationClientServer(t *testing.T) {
 				t.Error("ListenAndServe error: ", err)
 			}
 		}(srv, tc.transport, tc.serverAddr, tc.encrypted)
-		<-serverReady
+		select {
+		case <-serverReady:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("the %s listener was not ready", tc.transport)
+		}
 		t.Log("Server ready")
 	}
 
@@ -166,11 +174,16 @@ func TestIntegrationClientServer(t *testing.T) {
 			req, _, _ := createTestInvite(t, proto+":bob@"+tc.serverAddr, tc.transport, client.host)
 			tx, err := client.TransactionRequest(ctx, req)
 			require.NoError(t, err)
+			defer tx.Terminate()
 
-			res := <-tx.Responses()
-			assert.Equal(t, 200, res.StatusCode)
-
-			tx.Terminate()
+			select {
+			case res := <-tx.Responses():
+				assert.Equal(t, 200, res.StatusCode)
+			case <-tx.Done():
+				t.Fatalf("the INVITE got no answer: %v", tx.Err())
+			case <-time.After(5 * time.Second):
+				t.Fatal("the INVITE got no answer")
+			}
 		})
 	}
 }
@@ -265,6 +278,10 @@ func BenchmarkIntegrationClientServer(t *testing.B) {
 		shutdown()
 		wg.Wait()
 	})
+	// Handlers run off the benchmark goroutine, so they report their
+	// failures here for the benchmark goroutine.
+	errs := newHandlerErrors()
+	t.Cleanup(func() { errs.check(t) })
 
 	for _, tc := range testCases {
 		ua, _ := NewUA()
@@ -274,7 +291,8 @@ func BenchmarkIntegrationClientServer(t *testing.B) {
 		srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
 			res := sip.NewResponseFromRequest(req, 200, "OK", nil)
 			if err := tx.Respond(res); err != nil {
-				t.Fatal(err)
+				errs.report("respond 200: %w", err)
+				return
 			}
 			<-tx.Done()
 		})
@@ -300,7 +318,11 @@ func BenchmarkIntegrationClientServer(t *testing.B) {
 				t.Error("ListenAndServe error: ", err)
 			}
 		}(srv, tc.transport, tc.serverAddr, tc.encrypted)
-		<-serverReady
+		select {
+		case <-serverReady:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("the %s listener was not ready", tc.transport)
+		}
 		t.Log("Server ready")
 	}
 
@@ -335,13 +357,21 @@ func BenchmarkIntegrationClientServer(t *testing.B) {
 			t.ResetTimer()
 			t.ReportAllocs()
 
+			// The body runs off the benchmark goroutine, where the benchmark
+			// may not be stopped, so a failure is reported and the iterations
+			// go on until pb.Next says they are done.
 			t.RunParallel(func(p *testing.PB) {
 				// Build UAC
 				ua, _ := NewUA(WithUserAgenTLSConfig(clientTLS))
 				client, err := NewClient(ua)
-				require.NoError(t, err)
+				if err != nil {
+					t.Error(err)
+				}
 
 				for p.Next() {
+					if client == nil {
+						continue
+					}
 					// If we are running in limit mode
 					if maxInvitesPerSec != nil {
 						maxInvitesPerSec <- struct{}{}
@@ -349,10 +379,19 @@ func BenchmarkIntegrationClientServer(t *testing.B) {
 					req := sip.NewRequest(sip.INVITE, sip.Uri{User: "bob", Host: shost, Port: sport, Scheme: proto})
 					req.SetTransport(tc.transport)
 					tx, err := client.TransactionRequest(ctx, req)
-					require.NoError(t, err)
+					if err != nil {
+						t.Error(err)
+						continue
+					}
 
-					res := <-tx.Responses()
-					assert.Equal(t, 200, res.StatusCode)
+					select {
+					case res := <-tx.Responses():
+						assert.Equal(t, 200, res.StatusCode)
+					case <-tx.Done():
+						t.Errorf("the INVITE got no answer: %v", tx.Err())
+					case <-time.After(5 * time.Second):
+						t.Error("the INVITE got no answer")
+					}
 
 					tx.Terminate()
 				}
