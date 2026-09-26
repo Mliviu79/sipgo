@@ -841,3 +841,112 @@ func TestDialogServerByeAnswerFails(t *testing.T) {
 	}
 	assert.Nil(t, dialogSrv.loadDialog(d.ID), "the dialog is still cached")
 }
+
+// doneWatchCtx is a context that reports when Done is first called, which is
+// when a function waiting on it starts to wait.
+type doneWatchCtx struct {
+	context.Context
+	once    sync.Once
+	waiting chan struct{}
+}
+
+func newDoneWatchCtx(ctx context.Context) *doneWatchCtx {
+	return &doneWatchCtx{Context: ctx, waiting: make(chan struct{})}
+}
+
+func (c *doneWatchCtx) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.waiting) })
+	return c.Context.Done()
+}
+
+// TestDialogServerByeWaitsForAck has WriteBye wait for the ACK to our 2xx,
+// which RFC 3261 section 15 has the callee wait for before its BYE. The wait
+// ends on the ACK itself: T1 is set to a minute, so a wait that looked at the
+// state again only every T1 fails. A dialog that ends while WriteBye waits,
+// as on the peer's BYE, gets no BYE of ours.
+func TestDialogServerByeWaitsForAck(t *testing.T) {
+	if runInChildProcess(t) {
+		return
+	}
+	restoreSIPTimers(t)
+	sip.T1 = time.Minute
+
+	newDialog := func(t *testing.T, byes chan<- *sip.Request) (*DialogServerSession, *sip.Request, *sip.Response) {
+		t.Helper()
+		cli := testClientResponder(t, func(req *sip.Request, w *siptest.ClientTxResponder) {
+			byes <- req
+			w.Receive(sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil))
+		})
+		uasContact := sip.ContactHeader{
+			Address: sip.Uri{User: "test", Host: "127.0.0.200", Port: 5099},
+		}
+		dialogSrv := NewDialogServerCache(cli, uasContact)
+
+		invite, _, _ := createTestInvite(t, "sip:uas@127.0.0.1", "udp", "127.0.0.1:5090")
+		invite.AppendHeader(&sip.ContactHeader{Address: sip.Uri{Host: "uas", Port: 1234}})
+		tx := siptest.NewServerTxRecorder(invite)
+		t.Cleanup(tx.Terminate)
+
+		d, err := dialogSrv.ReadInvite(invite, tx)
+		require.NoError(t, err)
+		t.Cleanup(func() { d.Close() })
+		res200 := sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil)
+		d.InviteResponse = res200
+		d.setState(sip.DialogStateEstablished)
+		return d, invite, res200
+	}
+
+	t.Run("Ack", func(t *testing.T) {
+		byes := make(chan *sip.Request, 1)
+		d, _, res200 := newDialog(t, byes)
+		ctx := newDoneWatchCtx(context.Background())
+		sent := make(chan error, 1)
+		go func() { sent <- d.Bye(ctx) }()
+		select {
+		case <-ctx.waiting:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Bye did not wait for the ACK")
+		}
+
+		require.NoError(t, d.ReadAck(newAckRequestUAC(d.InviteRequest, res200, nil), nil))
+		select {
+		case bye := <-byes:
+			assert.Equal(t, sip.BYE, bye.Method)
+		case <-time.After(5 * time.Second):
+			t.Fatal("the BYE did not follow the ACK")
+		}
+		select {
+		case err := <-sent:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("Bye did not return")
+		}
+		assert.Equal(t, sip.DialogStateEnded, d.LoadState())
+	})
+
+	t.Run("EndedWhileWaiting", func(t *testing.T) {
+		byes := make(chan *sip.Request, 1)
+		d, _, _ := newDialog(t, byes)
+		ctx := newDoneWatchCtx(context.Background())
+		sent := make(chan error, 1)
+		go func() { sent <- d.Bye(ctx) }()
+		select {
+		case <-ctx.waiting:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Bye did not wait for the ACK")
+		}
+
+		d.setState(sip.DialogStateEnded)
+		select {
+		case err := <-sent:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("Bye did not return once the dialog ended")
+		}
+		select {
+		case bye := <-byes:
+			t.Fatalf("%s sent on a dialog that had ended", bye.StartLine())
+		default:
+		}
+	})
+}

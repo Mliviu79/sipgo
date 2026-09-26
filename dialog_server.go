@@ -435,21 +435,25 @@ func (s *DialogServerSession) WriteBye(ctx context.Context, bye *sip.Request) er
 
 	// This is tricky
 	defer s.inviteTx.Terminate() // Terminates INVITE in all cases
-	for {
-		state = s.state.Load()
-		if sip.DialogState(state) < sip.DialogStateConfirmed {
+	if sip.DialogState(state) < sip.DialogStateConfirmed {
+		// Wait for the ACK, which confirms the dialog, or for the INVITE
+		// transaction to time out. The state is loaded again after the read
+		// is registered, so a change made in between is not missed.
+		states := s.StateRead()
+	wait:
+		for state := s.LoadState(); state < sip.DialogStateConfirmed; {
 			select {
+			case state = <-states:
 			case <-s.inviteTx.Done():
-				// Wait until we timeout
-			case <-time.After(sip.T1):
-				// Recheck state
-				continue
+				break wait
 			case <-ctx.Done():
 				return ctx.Err()
 			}
 		}
-
-		break
+		// A dialog that ended meanwhile, as on the peer's BYE, needs none.
+		if s.LoadState() == sip.DialogStateEnded {
+			return nil
+		}
 	}
 
 	tx, err := s.TransactionRequest(ctx, bye)
