@@ -36,6 +36,31 @@ func TestDialogState(t *testing.T) {
 
 }
 
+// TestDialogStateOnlyMovesForward moves a dialog to each state and then back to
+// every earlier one. A dialog is established, then confirmed, then ended, and
+// never goes back: a move back is refused and reported to no callback.
+func TestDialogStateOnlyMovesForward(t *testing.T) {
+	states := []sip.DialogState{sip.DialogStateEstablished, sip.DialogStateConfirmed, sip.DialogStateEnded}
+	for i, s := range states {
+		t.Run(s.String(), func(t *testing.T) {
+			inv, _, _ := createTestInvite(t, "sip:nowhere", "udp", "127.0.0.1")
+			d := Dialog{InviteRequest: inv}
+			d.Init()
+			for _, forward := range states[:i+1] {
+				d.setState(forward)
+			}
+			rec := &stateRecorder{}
+			d.OnState(rec.record)
+
+			for _, back := range states[:i] {
+				d.setState(back)
+				assert.Equal(t, s, d.LoadState(), "moved back to %s", back)
+			}
+			assert.Empty(t, rec.recorded())
+		})
+	}
+}
+
 // stateRecorder records the states a state callback is told of.
 type stateRecorder struct {
 	mu     sync.Mutex

@@ -319,7 +319,8 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 	// The state is loaded after the read is registered, so a change made in
 	// between, such as the dialog ending, is not missed. An ended dialog gets
 	// no 2xx. When a CANCEL or the end of the transaction ended it, the
-	// transaction's error says so, as in the check above.
+	// transaction's error says so, as in the check above. A dialog already
+	// confirmed, answered again, waits for no ACK.
 	state := s.LoadState()
 	if state == sip.DialogStateEnded {
 		if err := tx.Err(); err != nil {

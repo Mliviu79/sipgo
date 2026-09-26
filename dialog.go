@@ -111,10 +111,12 @@ func (d *Dialog) InitWithState(s sip.DialogState) {
 	d.state.Store(int32(s))
 }
 
-// setState moves the dialog to s. Ended is final: a dialog that has ended
-// takes no other state, so a request handled late, such as an ACK read after
-// the BYE that followed it, cannot bring it back. A transition that changes
-// nothing, repeated or refused, calls no state callback.
+// setState moves the dialog to s. A dialog only moves forward, from
+// Established to Confirmed to Ended, so a request handled late, such as an ACK
+// read after the BYE that followed it, cannot bring an ended dialog back, and a
+// 2xx written again after the ACK does not take a confirmed dialog back to
+// Established. A transition that changes nothing, repeated or refused, calls
+// no state callback.
 func (d *Dialog) setState(s sip.DialogState) {
 	d.transition(s, nil)
 }
@@ -131,8 +133,7 @@ func (d *Dialog) endWithCause(err error) {
 // time tells the callbacks of the queue: the one that finds nobody doing it.
 func (d *Dialog) transition(s sip.DialogState, cause error) {
 	d.stateMu.Lock()
-	old := d.state.Load()
-	if old == int32(s) || old == int32(sip.DialogStateEnded) {
+	if d.state.Load() >= int32(s) {
 		d.stateMu.Unlock()
 		return
 	}

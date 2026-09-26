@@ -608,3 +608,63 @@ func TestDialogServerEndedWhileAnswering(t *testing.T) {
 	assert.Empty(t, conn.sendTimes(), "a 2xx was sent for a dialog that has ended")
 	assert.Equal(t, sip.DialogStateEnded, d.LoadState())
 }
+
+// TestDialogServerAnswerAgainAfterAck answers a dialog again once its 2xx has
+// been acknowledged. The dialog stays confirmed: WriteResponse neither moves it
+// back to Established nor waits for another ACK.
+func TestDialogServerAnswerAgainAfterAck(t *testing.T) {
+	ua, _ := NewUA()
+	defer ua.Close()
+	cli, _ := NewClient(ua)
+
+	uasContact := sip.ContactHeader{
+		Address: sip.Uri{User: "test", Host: "127.0.0.200", Port: 5099},
+	}
+	dialogSrv := NewDialogServerCache(cli, uasContact)
+
+	invite, _, _ := createTestInvite(t, "sip:uas@127.0.0.1", "udp", "127.0.0.1:5090")
+	invite.AppendHeader(&sip.ContactHeader{Address: sip.Uri{Host: "uas", Port: 1234}})
+	key, err := sip.ServerTxKeyMake(invite)
+	require.NoError(t, err)
+	conn := &sendTimesConn{wrote: make(chan struct{}, 1)}
+	tx := sip.NewServerTx(key, invite, conn, slog.Default())
+	require.NoError(t, tx.Init())
+	defer tx.Terminate()
+
+	d, err := dialogSrv.ReadInvite(invite, tx)
+	require.NoError(t, err)
+	defer d.Close()
+
+	res200 := sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil)
+	answered := make(chan error, 1)
+	go func() { answered <- d.WriteResponse(res200) }()
+	select {
+	case <-conn.wrote:
+	case err := <-answered:
+		t.Fatalf("WriteResponse returned %v before sending the 2xx", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the 2xx was not sent")
+	}
+	require.NoError(t, d.ReadAck(newAckRequestUAC(d.InviteRequest, res200, nil), tx))
+	select {
+	case err := <-answered:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteResponse did not return after the ACK")
+	}
+
+	states := d.StateRead()
+	go func() { answered <- d.WriteResponse(res200) }()
+	select {
+	case err := <-answered:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteResponse waits for another ACK to a confirmed dialog")
+	}
+	assert.Equal(t, sip.DialogStateConfirmed, d.LoadState())
+	select {
+	case s := <-states:
+		t.Fatalf("state %s reported for a confirmed dialog", s)
+	default:
+	}
+}
