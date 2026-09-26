@@ -177,8 +177,19 @@ func TestDialogServerRequestsWithinDialog(t *testing.T) {
 		_, err = dialog.TransactionRequest(context.TODO(), reinvite)
 		require.NoError(t, err)
 
+		// The BYE is answered on a connection of its own. The INVITE
+		// transaction sends 100 Trying from its timer goroutine once it has
+		// gone unanswered for 200 ms, and the writes of the two transactions
+		// must not share one buffer.
+		byeConn := &sip.UDPConnection{
+			PacketConn: &fakes.UDPConn{
+				Writers: map[string]io.Writer{
+					"127.0.0.1:5090": bytes.NewBuffer(make([]byte, 0)),
+				},
+			},
+		}
 		bye := newByeRequestUAC(invite, sip.NewResponseFromRequest(invite, 200, "OK", nil), nil)
-		tx = sip.NewServerTx("test-bye", bye, conn, slog.Default())
+		tx = sip.NewServerTx("test-bye", bye, byeConn, slog.Default())
 		tx.Init()
 		err = dialog.ReadBye(bye, tx)
 		require.NoError(t, err)
