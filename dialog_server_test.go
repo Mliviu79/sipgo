@@ -5,8 +5,10 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
+	"sync"
 	"testing"
 	"time"
 
@@ -421,5 +423,101 @@ func TestDialogServer2xxAckTimeout(t *testing.T) {
 			assert.Equal(t, sip.DialogStateConfirmed, d.LoadState())
 			assert.Greater(t, len(tx.Result()), 1, "the 2xx is retransmitted while waiting")
 		})
+	}
+}
+
+// sendTimesConn is a connection that records when each message is written.
+type sendTimesConn struct {
+	mu    sync.Mutex
+	times []time.Time
+	wrote chan struct{}
+}
+
+func (c *sendTimesConn) LocalAddr() net.Addr { return nil }
+
+func (c *sendTimesConn) WriteMsg(msg sip.Message) error {
+	c.mu.Lock()
+	c.times = append(c.times, time.Now())
+	c.mu.Unlock()
+	select {
+	case c.wrote <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (c *sendTimesConn) Ref(i int) int          { return 0 }
+func (c *sendTimesConn) TryClose() (int, error) { return 0, nil }
+func (c *sendTimesConn) Close() error           { return nil }
+func (c *sendTimesConn) sendTimes() []time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]time.Time(nil), c.times...)
+}
+
+// TestDialogServer2xxRetransmissionInterval checks the start of the 2xx
+// retransmission schedule of RFC 3261 section 13.3.1.4: the interval starts at
+// T1 and doubles for each retransmission, until it reaches T2.
+func TestDialogServer2xxRetransmissionInterval(t *testing.T) {
+	if runInChildProcess(t) {
+		return
+	}
+	sip.T1, sip.T2 = 10*time.Millisecond, time.Second
+
+	ua, _ := NewUA()
+	defer ua.Close()
+	cli, _ := NewClient(ua)
+
+	uasContact := sip.ContactHeader{
+		Address: sip.Uri{User: "test", Host: "127.0.0.200", Port: 5099},
+	}
+	dialogSrv := NewDialogServerCache(cli, uasContact)
+
+	invite, _, _ := createTestInvite(t, "sip:uas@127.0.0.1", "udp", "127.0.0.1:5090")
+	invite.AppendHeader(&sip.ContactHeader{Address: sip.Uri{Host: "uas", Port: 1234}})
+	key, err := sip.ServerTxKeyMake(invite)
+	require.NoError(t, err)
+	conn := &sendTimesConn{wrote: make(chan struct{}, 1)}
+	tx := sip.NewServerTx(key, invite, conn, slog.Default())
+	require.NoError(t, tx.Init())
+	defer tx.Terminate()
+
+	d, err := dialogSrv.ReadInvite(invite, tx)
+	require.NoError(t, err)
+	defer d.Close()
+
+	res200 := sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil)
+	answered := make(chan error, 1)
+	go func() { answered <- d.WriteResponse(res200) }()
+
+	// The 2xx and its first three retransmissions, all well within the 64*T1
+	// that WriteResponse waits for the ACK.
+	const sends = 4
+	deadline := time.After(10 * time.Second)
+	for len(conn.sendTimes()) < sends {
+		select {
+		case <-conn.wrote:
+		case err := <-answered:
+			t.Fatalf("WriteResponse returned %v after %d of %d transmissions of the 2xx", err, len(conn.sendTimes()), sends)
+		case <-deadline:
+			t.Fatalf("only %d of %d transmissions of the 2xx", len(conn.sendTimes()), sends)
+		}
+	}
+
+	ack := newAckRequestUAC(d.InviteRequest, res200, nil)
+	require.NoError(t, d.ReadAck(ack, tx))
+	select {
+	case err := <-answered:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteResponse did not return after the ACK")
+	}
+
+	times := conn.sendTimes()
+	for i, want := range []time.Duration{sip.T1, 2 * sip.T1, 4 * sip.T1} {
+		interval := times[i+1].Sub(times[i])
+		assert.GreaterOrEqual(t, interval, want, "retransmission %d", i+1)
+		// Far below T2, which the interval would only reach after the doubling.
+		assert.Less(t, interval, sip.T2/2, "retransmission %d", i+1)
 	}
 }

@@ -334,7 +334,8 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 	}
 
 	// We are following RFC 6026, which states that this is TU thing and not Transaction layer.
-	timer := time.NewTimer(sip.T1)
+	interval := sip.T1
+	timer := time.NewTimer(interval)
 	defer timer.Stop()
 
 	state := sip.DialogStateEstablished
@@ -357,7 +358,8 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 			//    interval that starts at T1 seconds and doubles for each
 			//    retransmission until it reaches T2 seconds (T1 and T2 are defined in
 			//    Section 17).
-			timer.Reset(max(2*sip.T1, sip.T2))
+			interval = min(2*interval, sip.T2)
+			timer.Reset(interval)
 
 		case <-ackTimeout.C:
 			return s.ackTimedOut()
