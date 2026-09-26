@@ -30,9 +30,14 @@ func (s *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction
 	return nil
 }
 
+// ReadBye answers the peer's BYE and ends the dialog. A BYE below the remote
+// sequence number, which a request of the peer read before it, such as a
+// re-INVITE, set, is out of order: it is answered 500, ErrDialogInvalidCseq is
+// returned and the dialog goes on (RFC 3261 section 12.2.2). The remote
+// sequence number is left as it is, so the ACK to our 2xx, read after the BYE
+// when it is overtaken, still matches it.
 func (s *DialogServerSession) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
-	// Make sure this is bye for this dialog
-	if err := s.validateRequest(req); err != nil {
+	if err := s.refuseOutOfOrder(req, tx); err != nil {
 		return err
 	}
 
@@ -467,15 +472,6 @@ func (s *DialogServerSession) WriteBye(ctx context.Context, bye *sip.Request) er
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-}
-
-func (dt *DialogServerSession) validateRequest(req *sip.Request) (err error) {
-	// Make sure this is bye for this dialog
-
-	if req.CSeq().SeqNo < dt.InviteRequest.CSeq().SeqNo {
-		return ErrDialogInvalidCseq
-	}
-	return nil
 }
 
 // DialogServerCache serves as quick way to start building dialog server

@@ -510,6 +510,95 @@ func TestDialogClientByeBeforeAckReturns(t *testing.T) {
 	}
 }
 
+// TestDialogClientByeOutOfOrder reads the peer's BYE on the calling side. The
+// remote sequence number is empty until the peer's first request in the dialog
+// (RFC 3261 section 12.1.2), whatever the CSeq of our INVITE, and a request
+// below it is out of order and answered 500 (section 12.2.2): the dialog goes
+// on until a BYE in order ends it.
+func TestDialogClientByeOutOfOrder(t *testing.T) {
+	newDialog := func(t *testing.T, inviteSeqNo uint32) *DialogClientSession {
+		client := testClient(t, func(req *sip.Request) *sip.Response {
+			res := sip.NewResponseFromRequest(req, 200, "OK", nil)
+			if req.IsInvite() {
+				res.To().Params.Add("tag", sip.GenerateTagN(16))
+				res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "uas", Host: "127.0.0.1", Port: 5090}})
+			}
+			return res
+		})
+		dua := DialogUA{
+			Client:     client,
+			ContactHDR: sip.ContactHeader{Address: sip.Uri{User: "uac", Host: "127.0.0.1", Port: 5060}},
+		}
+		invite := sip.NewRequest(sip.INVITE, sip.Uri{User: "test", Host: "localhost"})
+		invite.AppendHeader(&sip.CSeqHeader{SeqNo: inviteSeqNo, MethodName: sip.INVITE})
+		d, err := dua.WriteInvite(context.TODO(), invite)
+		require.NoError(t, err)
+		require.NoError(t, d.WaitAnswer(context.TODO(), AnswerOptions{}))
+		require.NoError(t, d.Ack(context.TODO()))
+		return d
+	}
+	// peerRequest builds a request the peer makes in the dialog.
+	peerRequest := func(d *DialogClientSession, method sip.RequestMethod, seqNo uint32) *sip.Request {
+		req := sip.NewRequest(method, d.InviteRequest.Contact().Address)
+		from := d.InviteResponse.To().AsFrom()
+		to := d.InviteRequest.From().AsTo()
+		req.AppendHeader(&from)
+		req.AppendHeader(&to)
+		req.AppendHeader(sip.HeaderClone(d.InviteRequest.CallID()))
+		req.AppendHeader(&sip.CSeqHeader{SeqNo: seqNo, MethodName: method})
+		var params sip.HeaderParams
+		params.Add("branch", sip.GenerateBranch())
+		req.PrependHeader(&sip.ViaHeader{
+			ProtocolName:    "SIP",
+			ProtocolVersion: "2.0",
+			Transport:       "UDP",
+			Host:            "127.0.0.1",
+			Port:            5090,
+			Params:          params,
+		})
+		return req
+	}
+	readBye := func(t *testing.T, d *DialogClientSession, seqNo uint32) (error, int) {
+		t.Helper()
+		bye := peerRequest(d, sip.BYE, seqNo)
+		tx := siptest.NewServerTxRecorder(bye)
+		t.Cleanup(tx.Terminate)
+		err := d.ReadBye(bye, tx)
+		answers := tx.Result()
+		require.Len(t, answers, 1, "the BYE is answered once")
+		return err, answers[0].StatusCode
+	}
+
+	t.Run("BelowReinvite", func(t *testing.T) {
+		d := newDialog(t, 1)
+		reinvite := peerRequest(d, sip.INVITE, 20)
+		require.NoError(t, d.ReadRequest(reinvite, siptest.NewServerTxRecorder(reinvite)))
+
+		err, code := readBye(t, d, 19)
+		require.ErrorIs(t, err, ErrDialogInvalidCseq)
+		assert.Equal(t, sip.StatusInternalServerError, code)
+		assert.Equal(t, sip.DialogStateConfirmed, d.LoadState())
+
+		err, code = readBye(t, d, 21)
+		require.NoError(t, err)
+		assert.Equal(t, sip.StatusOK, code)
+		assert.Equal(t, sip.DialogStateEnded, d.LoadState())
+	})
+
+	t.Run("FirstRequestBelowInvite", func(t *testing.T) {
+		// The peer numbers its requests apart from ours: its first request
+		// sets the remote sequence number, even below our INVITE's CSeq.
+		d := newDialog(t, 20000)
+		reinvite := peerRequest(d, sip.INVITE, 5)
+		require.NoError(t, d.ReadRequest(reinvite, siptest.NewServerTxRecorder(reinvite)))
+
+		err, code := readBye(t, d, 6)
+		require.NoError(t, err)
+		assert.Equal(t, sip.StatusOK, code)
+		assert.Equal(t, sip.DialogStateEnded, d.LoadState())
+	})
+}
+
 func BenchmarkDialogDo(b *testing.B) {
 	ua, _ := NewUA()
 	cli, _ := NewClient(ua)

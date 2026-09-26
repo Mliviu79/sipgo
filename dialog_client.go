@@ -21,7 +21,14 @@ type DialogClientSession struct {
 	onClose func()
 }
 
+// ReadBye answers the peer's BYE and ends the dialog. A BYE below the remote
+// sequence number, which a request of the peer read before it, such as a
+// re-INVITE, set, is out of order: it is answered 500, ErrDialogInvalidCseq is
+// returned and the dialog goes on (RFC 3261 section 12.2.2).
 func (s *DialogClientSession) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
+	if err := s.refuseOutOfOrder(req, tx); err != nil {
+		return err
+	}
 	s.setState(sip.DialogStateEnded)
 
 	res := sip.NewResponseFromRequest(req, 200, "OK", nil)

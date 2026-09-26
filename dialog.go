@@ -250,6 +250,19 @@ func (d *Dialog) Context() context.Context {
 	return d.ctx
 }
 
+// refuseOutOfOrder answers 500 to a request whose CSeq is below the remote
+// sequence number and returns ErrDialogInvalidCseq, joined with any error
+// sending the answer. RFC 3261 section 12.2.2 has such a request rejected as
+// out of order. It returns nil for a request in order, and leaves the remote
+// sequence number as it is.
+func (d *Dialog) refuseOutOfOrder(req *sip.Request, tx sip.ServerTransaction) error {
+	if req.CSeq().SeqNo >= d.remoteCSeqNo.Load() {
+		return nil
+	}
+	res := sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "Internal Server Error", nil)
+	return errors.Join(ErrDialogInvalidCseq, tx.Respond(res))
+}
+
 func (d *Dialog) ReadRequest(req *sip.Request, tx sip.ServerTransaction) error {
 	// UAS role of dialog SHOULD be
 	// prepared to receive and process requests with CSeq values more than

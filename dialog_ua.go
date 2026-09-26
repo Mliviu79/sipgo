@@ -126,6 +126,10 @@ func (c *DialogUA) WriteInvite(ctx context.Context, inviteReq *sip.Request, opti
 	}
 	// Init our dialog
 	dtx.Dialog.Init()
+	// The remote sequence number is empty until the peer sends a request in
+	// the dialog (RFC 3261 section 12.1.2): the peer numbers its requests
+	// apart from ours. No CSeq is below zero.
+	dtx.remoteCSeqNo.Store(0)
 
 	return dtx, dtx.Invite(ctx, options...)
 }

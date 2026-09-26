@@ -148,9 +148,19 @@ func TestDialogServerRequestsWithinDialog(t *testing.T) {
 		require.NoError(t, err)
 		defer dialog.Close()
 
+		// The BYE is answered on a connection of its own: it is answered 500,
+		// and the INVITE transaction sends 100 Trying from its timer goroutine
+		// once it has gone unanswered for 200 ms.
+		byeConn := &sip.UDPConnection{
+			PacketConn: &fakes.UDPConn{
+				Writers: map[string]io.Writer{
+					"127.0.0.1:5090": bytes.NewBuffer(make([]byte, 0)),
+				},
+			},
+		}
 		byeWrongCseq := newByeRequestUAC(invite, sip.NewResponseFromRequest(invite, 200, "OK", nil), nil)
 		byeWrongCseq.CSeq().SeqNo--
-		tx = sip.NewServerTx("test", byeWrongCseq, conn, slog.Default())
+		tx = sip.NewServerTx("test", byeWrongCseq, byeConn, slog.Default())
 		tx.Init()
 		err = dialog.ReadBye(byeWrongCseq, tx)
 		require.ErrorIs(t, err, ErrDialogInvalidCseq)
@@ -723,4 +733,72 @@ func TestDialogServerCanceledWhileAnswering(t *testing.T) {
 		t.Fatal("the context of the canceled dialog is not done")
 	}
 	assert.ErrorIs(t, context.Cause(d.Context()), sip.ErrTransactionCanceled)
+}
+
+// newInDialogRequest builds a request the peer that sent invite makes in the
+// dialog res established, with the method and CSeq given.
+func newInDialogRequest(invite *sip.Request, res *sip.Response, method sip.RequestMethod, seqNo uint32) *sip.Request {
+	req := newByeRequestUAC(invite, res, nil)
+	req.Method = method
+	req.CSeq().MethodName = method
+	req.CSeq().SeqNo = seqNo
+	var params sip.HeaderParams
+	params.Add("branch", sip.GenerateBranch())
+	req.PrependHeader(&sip.ViaHeader{
+		ProtocolName:    "SIP",
+		ProtocolVersion: "2.0",
+		Transport:       "UDP",
+		Host:            "127.0.0.1",
+		Port:            5090,
+		Params:          params,
+	})
+	return req
+}
+
+// TestDialogServerByeOutOfOrder reads a BYE whose CSeq is below that of a
+// re-INVITE read before it. RFC 3261 section 12.2.2 has a request below the
+// remote sequence number rejected with 500 as out of order: the BYE is answered
+// 500 and the dialog goes on, until a BYE in order ends it.
+func TestDialogServerByeOutOfOrder(t *testing.T) {
+	ua, _ := NewUA()
+	defer ua.Close()
+	cli, _ := NewClient(ua)
+
+	uasContact := sip.ContactHeader{
+		Address: sip.Uri{User: "test", Host: "127.0.0.200", Port: 5099},
+	}
+	dialogSrv := NewDialogServerCache(cli, uasContact)
+
+	invite, _, _ := createTestInvite(t, "sip:uas@127.0.0.1", "udp", "127.0.0.1:5090")
+	invite.AppendHeader(&sip.ContactHeader{Address: sip.Uri{Host: "uas", Port: 1234}})
+	tx := siptest.NewServerTxRecorder(invite)
+	defer tx.Terminate()
+
+	d, err := dialogSrv.ReadInvite(invite, tx)
+	require.NoError(t, err)
+	defer d.Close()
+	res200 := sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil)
+	d.setState(sip.DialogStateConfirmed)
+
+	seqNo := invite.CSeq().SeqNo
+	reinvite := newInDialogRequest(invite, res200, sip.INVITE, seqNo+2)
+	require.NoError(t, d.ReadRequest(reinvite, siptest.NewServerTxRecorder(reinvite)))
+
+	bye := newInDialogRequest(invite, res200, sip.BYE, seqNo+1)
+	byeTx := siptest.NewServerTxRecorder(bye)
+	defer byeTx.Terminate()
+	require.ErrorIs(t, d.ReadBye(bye, byeTx), ErrDialogInvalidCseq)
+	answers := byeTx.Result()
+	require.Len(t, answers, 1, "the out-of-order BYE is answered once")
+	assert.Equal(t, sip.StatusInternalServerError, answers[0].StatusCode)
+	assert.Equal(t, sip.DialogStateConfirmed, d.LoadState())
+
+	bye = newInDialogRequest(invite, res200, sip.BYE, seqNo+3)
+	byeTx = siptest.NewServerTxRecorder(bye)
+	defer byeTx.Terminate()
+	require.NoError(t, d.ReadBye(bye, byeTx))
+	answers = byeTx.Result()
+	require.Len(t, answers, 1)
+	assert.Equal(t, sip.StatusOK, answers[0].StatusCode)
+	assert.Equal(t, sip.DialogStateEnded, d.LoadState())
 }
