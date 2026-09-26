@@ -35,8 +35,8 @@ func TestClientRequestBuild(t *testing.T) {
 		User:      "bob",
 		Host:      "10.2.2.2",
 		Port:      5060,
-		Headers:   sip.HeaderParams{{"transport", "udp"}},
-		UriParams: sip.HeaderParams{{"foo", "bar"}},
+		Headers:   sip.HeaderParams{{K: "transport", V: "udp"}},
+		UriParams: sip.HeaderParams{{K: "foo", V: "bar"}},
 	}
 
 	req := sip.NewRequest(sip.OPTIONS, recipment)

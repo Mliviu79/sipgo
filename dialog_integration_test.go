@@ -76,7 +76,8 @@ func TestIntegrationDialog(t *testing.T) {
 		}
 
 		time.Sleep(1 * time.Second)
-		ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		dlg.Bye(ctx)
 
 		// ctx, _ := context.WithTimeout(ctx, 3*time.Second)
@@ -309,7 +310,8 @@ func TestIntegrationDialogBrokenUAC(t *testing.T) {
 			// ACK
 			t.Log("UAC: ACK")
 			sess.InviteResponse.Contact().Address.Host = "nodestination.dst"
-			ctx, _ := context.WithTimeout(context.Background(), 1*time.Millisecond)
+			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+			defer cancel()
 			err = sess.Ack(ctx)
 			require.Error(t, err)
 
