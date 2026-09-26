@@ -409,36 +409,54 @@ func TestDialogClientMultiResponses(t *testing.T) {
 	})
 }
 
+// TestDialogClientACKRetransmission receives the 2xx three times and checks
+// that each copy is acknowledged. Each retransmission is received once the ACK
+// to the copy before it has been sent, so every one of them arrives after Ack.
 func TestDialogClientACKRetransmission(t *testing.T) {
 	var acks int32
+	acked := make(chan struct{}, 8)
+	allAcked := make(chan struct{})
 	client := testClientResponder(t, func(req *sip.Request, w *siptest.ClientTxResponder) {
 		if req.IsAck() {
 			atomic.AddInt32(&acks, 1)
+			acked <- struct{}{}
 			return
 		}
 
 		res := sip.NewResponseFromRequest(req, 200, "OK", nil)
 		w.Receive(res)
-		time.Sleep(sip.T1)
-		w.Receive(res)
-		time.Sleep(sip.T1)
-		w.Receive(res)
+		for range 2 {
+			select {
+			case <-acked:
+			case <-time.After(5 * time.Second):
+				return
+			}
+			w.Receive(res)
+		}
+		select {
+		case <-acked:
+			close(allAcked)
+		case <-time.After(5 * time.Second):
+		}
 	})
 
 	dua := DialogUA{
 		Client: client,
 	}
-	d, err := dua.Invite(context.TODO(), sip.Uri{User: "test", Host: "localhost"}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	d, err := dua.Invite(ctx, sip.Uri{User: "test", Host: "localhost"}, nil)
 	require.NoError(t, err)
-	err = d.WaitAnswer(context.TODO(), AnswerOptions{})
+	err = d.WaitAnswer(ctx, AnswerOptions{})
 	require.NoError(t, err)
 
 	// We will keep receiving retransmission
-	if err := d.Ack(context.TODO()); err != nil {
-		t.Error(err)
+	require.NoError(t, d.Ack(ctx))
+	select {
+	case <-allAcked:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("%d of the 3 copies of the 2xx were acknowledged", atomic.LoadInt32(&acks))
 	}
-	time.Sleep(4 * sip.T1)
-	// It should retransmit
 	state := d.LoadState()
 	assert.Equal(t, sip.DialogStateConfirmed, state)
 	assert.EqualValues(t, 3, atomic.LoadInt32(&acks))

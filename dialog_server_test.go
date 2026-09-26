@@ -196,8 +196,9 @@ func TestDialogServerRequestsWithinDialog(t *testing.T) {
 	})
 }
 
+// TestDialogServer2xxRetransmission reads the ACK once the 2xx has been
+// retransmitted, and checks that the ACK ends the retransmissions.
 func TestDialogServer2xxRetransmission(t *testing.T) {
-	// sip.T1 = 1
 	ua, _ := NewUA()
 	defer ua.Close()
 	cli, _ := NewClient(ua)
@@ -211,27 +212,46 @@ func TestDialogServer2xxRetransmission(t *testing.T) {
 	invite.AppendHeader(&sip.ContactHeader{Address: sip.Uri{Host: "uas", Port: 1234}})
 
 	// Create a server transcation
-	tx := siptest.NewServerTxRecorder(invite)
+	key, err := sip.ServerTxKeyMake(invite)
+	require.NoError(t, err)
+	conn := &sendTimesConn{wrote: make(chan struct{}, 1)}
+	tx := sip.NewServerTx(key, invite, conn, slog.Default())
+	require.NoError(t, tx.Init())
+	defer tx.Terminate()
 
 	// Read Invite
 	d, err := dialogSrv.ReadInvite(invite, tx)
 	require.NoError(t, err)
+	defer d.Close()
 
-	res200 := sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil)
-	ackReceive := newAckRequestUAC(d.InviteRequest, res200, nil)
-	go func() {
-		// Delay ACK receiving
-		time.Sleep(2 * sip.T1)
-		d.ReadAck(ackReceive, tx)
-	}()
 	// Respond 200
 	// This will block until ACK
-	err = d.WriteResponse(res200)
-	require.NoError(t, err)
+	res200 := sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil)
+	answered := make(chan error, 1)
+	go func() { answered <- d.WriteResponse(res200) }()
 
-	// We must have at least 2 responses
-	resps := tx.Result()
-	require.Len(t, resps, 2)
+	deadline := time.After(10 * time.Second)
+	for len(conn.sendTimes()) < 2 {
+		select {
+		case <-conn.wrote:
+		case err := <-answered:
+			t.Fatalf("WriteResponse returned %v before the 2xx was retransmitted", err)
+		case <-deadline:
+			t.Fatalf("the 2xx was sent %d times and not retransmitted", len(conn.sendTimes()))
+		}
+	}
+
+	acked := len(conn.sendTimes())
+	ackReceive := newAckRequestUAC(d.InviteRequest, res200, nil)
+	require.NoError(t, d.ReadAck(ackReceive, tx))
+	select {
+	case err := <-answered:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteResponse did not return after the ACK")
+	}
+	// At most the retransmission already due when the ACK was read follows it.
+	assert.LessOrEqual(t, len(conn.sendTimes()), acked+1, "the 2xx was retransmitted after its ACK")
 }
 
 // TestDialogServerAckAfterBye reads the ACK to our 2xx after the BYE that the
@@ -438,7 +458,9 @@ func TestDialogServer2xxAckTimeout(t *testing.T) {
 	}
 }
 
-// sendTimesConn is a connection that records when each message is written.
+// sendTimesConn is a connection that records when each 2xx response is
+// written. It leaves out the 100 Trying that an INVITE transaction sends when
+// nothing is answered within 200 ms.
 type sendTimesConn struct {
 	mu    sync.Mutex
 	times []time.Time
@@ -448,6 +470,9 @@ type sendTimesConn struct {
 func (c *sendTimesConn) LocalAddr() net.Addr { return nil }
 
 func (c *sendTimesConn) WriteMsg(msg sip.Message) error {
+	if res, ok := msg.(*sip.Response); !ok || !res.IsSuccess() {
+		return nil
+	}
 	c.mu.Lock()
 	c.times = append(c.times, time.Now())
 	c.mu.Unlock()
