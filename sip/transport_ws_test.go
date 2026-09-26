@@ -407,7 +407,11 @@ func TestWSConnectionConcurrentWrites(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 
 	c := newWSConnection(serverConn, false, 1)
-	go c.keepalive(DefaultLogger())
+	keepaliveDone := make(chan struct{})
+	go func() {
+		c.keepalive(DefaultLogger())
+		close(keepaliveDone)
+	}()
 
 	// Deadlines bound both ends. If writes interleave the peer sees a corrupt
 	// frame and stops reading, which would otherwise block the writers on the
@@ -464,4 +468,12 @@ func TestWSConnectionConcurrentWrites(t *testing.T) {
 
 	require.NoError(t, c.Close())
 	_ = clientConn.Close()
+
+	// The keepalive goroutine reads the period that the cleanup restores. It
+	// may not have sent a ping yet, which would order the two, so it is joined.
+	select {
+	case <-keepaliveDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("keepalive goroutine leaked after close")
+	}
 }
