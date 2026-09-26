@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 
 	"github.com/emiago/sipgo/sip"
@@ -48,6 +49,11 @@ type Dialog struct {
 	InviteResponse *sip.Response
 
 	state atomic.Int32
+	// stateMu orders the state transitions and guards the queue of those
+	// the state callbacks are yet to be told of, see transition.
+	stateMu        sync.Mutex
+	stateQueue     []sip.DialogState
+	stateNotifying bool
 
 	ctx    context.Context
 	cancel context.CancelCauseFunc
@@ -69,6 +75,12 @@ func (d *Dialog) Init() {
 	d.onStatePointer = atomic.Pointer[DialogStateFn]{}
 }
 
+// OnState adds f to the callbacks told of each state transition, which are
+// called newest first. They are told of one transition at a time, in the order
+// the dialog took them, and with no lock held, so a callback may make a
+// transition or send a request. A transition made while callbacks run is told
+// once they have returned, and so possibly after the call that made it has
+// returned.
 func (d *Dialog) OnState(f DialogStateFn) {
 	for {
 		current := d.onStatePointer.Load()
@@ -104,40 +116,71 @@ func (d *Dialog) InitWithState(s sip.DialogState) {
 // the BYE that followed it, cannot bring it back. A transition that changes
 // nothing, repeated or refused, calls no state callback.
 func (d *Dialog) setState(s sip.DialogState) {
-	for {
-		old := d.state.Load()
-		if old == int32(s) || old == int32(sip.DialogStateEnded) {
-			return
-		}
-		if d.state.CompareAndSwap(old, int32(s)) {
-			break
-		}
-	}
-
-	if s == sip.DialogStateEnded {
-		d.cancel(nil)
-	}
-
-	if f := d.onStatePointer.Load(); f != nil {
-		cb := *f
-		cb(s)
-	}
+	d.transition(s, nil)
 }
 
 // endWithCause sets dialog state ended and place context cause error
 // Experimental
 func (d *Dialog) endWithCause(err error) {
-	s := sip.DialogStateEnded
-	old := d.state.Swap(int32(s))
-	if old == int32(s) {
-		// Safety
+	d.transition(sip.DialogStateEnded, err)
+}
+
+// transition moves the dialog to s as setState describes, ending its context
+// with cause when s is Ended, and has the state callbacks told of it. The
+// transitions are queued in the order they are made, and one goroutine at a
+// time tells the callbacks of the queue: the one that finds nobody doing it.
+func (d *Dialog) transition(s sip.DialogState, cause error) {
+	d.stateMu.Lock()
+	old := d.state.Load()
+	if old == int32(s) || old == int32(sip.DialogStateEnded) {
+		d.stateMu.Unlock()
 		return
 	}
-	d.cancel(err)
+	d.state.Store(int32(s))
+	if s == sip.DialogStateEnded {
+		// Before any callback is told of the end.
+		d.cancel(cause)
+	}
+	d.stateQueue = append(d.stateQueue, s)
+	notify := !d.stateNotifying
+	d.stateNotifying = true
+	d.stateMu.Unlock()
 
-	if f := d.onStatePointer.Load(); f != nil {
-		cb := *f
-		cb(s)
+	if notify {
+		d.notifyStates()
+	}
+}
+
+// notifyStates tells the state callbacks of each queued transition in turn,
+// until the queue is empty. No lock is held while a callback runs.
+func (d *Dialog) notifyStates() {
+	emptied := false
+	defer func() {
+		if !emptied {
+			// A callback panicked. The transitions still queued are told by
+			// the goroutine of the next one.
+			d.stateMu.Lock()
+			d.stateNotifying = false
+			d.stateMu.Unlock()
+		}
+	}()
+
+	for {
+		d.stateMu.Lock()
+		if len(d.stateQueue) == 0 {
+			d.stateNotifying = false
+			d.stateMu.Unlock()
+			emptied = true
+			return
+		}
+		s := d.stateQueue[0]
+		d.stateQueue = d.stateQueue[1:]
+		d.stateMu.Unlock()
+
+		if f := d.onStatePointer.Load(); f != nil {
+			cb := *f
+			cb(s)
+		}
 	}
 }
 
