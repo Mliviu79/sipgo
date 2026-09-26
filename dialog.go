@@ -116,9 +116,9 @@ func (d *Dialog) InitWithState(s sip.DialogState) {
 // read after the BYE that followed it, cannot bring an ended dialog back, and a
 // 2xx written again after the ACK does not take a confirmed dialog back to
 // Established. A transition that changes nothing, repeated or refused, calls
-// no state callback.
-func (d *Dialog) setState(s sip.DialogState) {
-	d.transition(s, nil)
+// no state callback. It reports whether the dialog moved to s.
+func (d *Dialog) setState(s sip.DialogState) bool {
+	return d.transition(s, nil)
 }
 
 // endWithCause sets dialog state ended and place context cause error
@@ -131,11 +131,12 @@ func (d *Dialog) endWithCause(err error) {
 // with cause when s is Ended, and has the state callbacks told of it. The
 // transitions are queued in the order they are made, and one goroutine at a
 // time tells the callbacks of the queue: the one that finds nobody doing it.
-func (d *Dialog) transition(s sip.DialogState, cause error) {
+// It reports whether the dialog moved to s.
+func (d *Dialog) transition(s sip.DialogState, cause error) bool {
 	d.stateMu.Lock()
 	if d.state.Load() >= int32(s) {
 		d.stateMu.Unlock()
-		return
+		return false
 	}
 	d.state.Store(int32(s))
 	if s == sip.DialogStateEnded {
@@ -150,6 +151,7 @@ func (d *Dialog) transition(s sip.DialogState, cause error) {
 	if notify {
 		d.notifyStates()
 	}
+	return true
 }
 
 // notifyStates tells the state callbacks of each queued transition in turn,

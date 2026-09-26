@@ -262,7 +262,9 @@ func (s *DialogServerSession) authDigest(chal *digest.Challenge, opts digest.Opt
 // A 2xx is retransmitted until its ACK is read, which WriteResponse waits for.
 // If no ACK arrives within 64*T1, the dialog is confirmed and ErrDialogAckTimeout
 // is returned: end the session with Bye (RFC 3261 section 13.3.1.4). If the
-// dialog ends first, ErrDialogEndedBeforeAck is returned.
+// dialog ends first, ErrDialogEndedBeforeAck is returned. If the transaction
+// takes no 2xx, as after a CANCEL, its error is returned and the dialog the 2xx
+// established ends.
 func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 	tx := s.inviteTx
 
@@ -311,7 +313,7 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 		return fmt.Errorf("ID do not match. Invite request has changed headers?")
 	}
 
-	s.setState(sip.DialogStateEstablished)
+	established := s.setState(sip.DialogStateEstablished)
 
 	// Register dialog state read channel before transmitting 200 OK. This prevents a race
 	// condition where the ACK is received before we start waiting for it.
@@ -343,6 +345,12 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 	defer ackTimeout.Stop()
 
 	if err := tx.Respond(res); err != nil {
+		// The transaction took no 2xx, for example after a CANCEL read once
+		// the dialog was established, which it answered 487. A dialog this
+		// call established is then never answered, and ends with the cause.
+		if established {
+			s.endWithCause(err)
+		}
 		return err
 	}
 
