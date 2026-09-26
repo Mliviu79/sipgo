@@ -432,9 +432,15 @@ func (txl *TransactionLayer) Request(ctx context.Context, req *Request) (*Client
 	return tx, nil
 }
 
+// NewClientTransaction creates the client transaction for req, taking a
+// connection for it. A request is never sent on a done ctx: its error is
+// returned, and nothing is created or sent.
 func (txl *TransactionLayer) NewClientTransaction(ctx context.Context, req *Request) (*ClientTx, error) {
 	if req.IsAck() {
 		return nil, fmt.Errorf("ACK request must be sent directly through transport")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	key, err := ClientTxKeyMake(req)

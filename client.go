@@ -144,6 +144,9 @@ func (c *Client) Hostname() string {
 // To, From, CSeq, Call-ID, Max-Forwards, Via
 // Passing options will override this behavior, that is, it is expected that your request is already prebuild
 // This is mostly the case when creating proxy
+//
+// A request is not sent on a ctx that is already done: the transaction layer
+// returns ctx's error instead. A TxRequester is handed ctx to do the same.
 func (c *Client) TransactionRequest(ctx context.Context, req *sip.Request, options ...ClientRequestOption) (sip.ClientTransaction, error) {
 	if req.IsAck() {
 		return nil, fmt.Errorf("ACK request must be sent directly through transport. Use WriteRequest")

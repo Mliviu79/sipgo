@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/emiago/sipgo/sip"
 	"github.com/emiago/sipgo/siptest"
@@ -405,4 +406,99 @@ func BenchmarkClientTransactionRequestBuild(t *testing.B) {
 		req := sip.NewRequest(sip.INVITE, sip.Uri{User: "test", Host: "localhost"})
 		clientRequestBuildReq(c, req)
 	}
+}
+
+// TestClientSendsNothingOnDoneContext makes requests on a context that is
+// already done. Nothing may go on the wire: each call returns the context's
+// error, and the first request the peer reads is one made afterwards on a live
+// context.
+func TestClientSendsNothingOnDoneContext(t *testing.T) {
+	ua, _ := NewUA()
+	defer ua.Close()
+	cli, err := NewClient(ua)
+	require.NoError(t, err)
+
+	done, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// newPeer listens for the requests of one subtest.
+	newPeer := func(t *testing.T) (net.PacketConn, sip.Uri) {
+		t.Helper()
+		peer, err := net.ListenPacket("udp", "127.0.0.1:0")
+		require.NoError(t, err)
+		t.Cleanup(func() { peer.Close() })
+		addr := peer.LocalAddr().(*net.UDPAddr)
+		return peer, sip.Uri{User: "peer", Host: addr.IP.String(), Port: addr.Port}
+	}
+
+	// probe sends a request on a live context and checks that it is the first
+	// request the peer reads, which it answers.
+	probe := func(t *testing.T, peer net.PacketConn, peerURI sip.Uri) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		req := sip.NewRequest(sip.OPTIONS, peerURI)
+		req.AppendHeader(sip.NewHeader("X-Probe", "live"))
+		answered := make(chan error, 1)
+		go func() {
+			_, err := cli.Do(ctx, req)
+			answered <- err
+		}()
+
+		buf := make([]byte, 65535)
+		require.NoError(t, peer.SetReadDeadline(time.Now().Add(5*time.Second)))
+		n, from, err := peer.ReadFrom(buf)
+		require.NoError(t, err, "the peer read no request")
+		msg, err := sip.NewParser().ParseSIP(buf[:n])
+		require.NoError(t, err)
+		got, ok := msg.(*sip.Request)
+		require.True(t, ok)
+		require.NotNil(t, got.GetHeader("X-Probe"), "the peer read %s, which was made on a done context", got.StartLine())
+
+		res := sip.NewResponseFromRequest(got, sip.StatusOK, "OK", nil)
+		_, err = peer.WriteTo([]byte(res.String()), from)
+		require.NoError(t, err)
+		select {
+		case err := <-answered:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("the probe was not answered")
+		}
+	}
+
+	t.Run("Do", func(t *testing.T) {
+		peer, peerURI := newPeer(t)
+		_, err := cli.Do(done, sip.NewRequest(sip.OPTIONS, peerURI))
+		require.ErrorIs(t, err, context.Canceled)
+		probe(t, peer, peerURI)
+	})
+
+	t.Run("DialogDo", func(t *testing.T) {
+		peer, peerURI := newPeer(t)
+		invite := sip.NewRequest(sip.INVITE, peerURI)
+		require.NoError(t, clientRequestBuildReq(cli, invite))
+		invite.AppendHeader(&sip.ContactHeader{Address: sip.Uri{Host: "127.0.0.1", Port: 5060}})
+		res := sip.NewResponseFromRequest(invite, sip.StatusOK, "OK", nil)
+		res.To().Params.Add("tag", sip.GenerateTagN(16))
+		res.AppendHeader(&sip.ContactHeader{Address: peerURI})
+		d := &DialogClientSession{
+			UA:     &DialogUA{Client: cli},
+			Dialog: Dialog{InviteRequest: invite, InviteResponse: res},
+		}
+		d.Init()
+
+		_, err := d.Do(done, sip.NewRequest(sip.INFO, peerURI))
+		require.ErrorIs(t, err, context.Canceled)
+		probe(t, peer, peerURI)
+	})
+
+	t.Run("DialogInvite", func(t *testing.T) {
+		peer, peerURI := newPeer(t)
+		// A Contact without a port takes the port of the connection, which
+		// has the INVITE made on a transaction of its own.
+		dua := DialogUA{Client: cli, ContactHDR: sip.ContactHeader{Address: sip.Uri{User: "uac"}}}
+		_, err := dua.Invite(done, peerURI, nil)
+		require.ErrorIs(t, err, context.Canceled)
+		probe(t, peer, peerURI)
+	})
 }
