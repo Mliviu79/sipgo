@@ -327,6 +327,7 @@ func (tx *ServerTx) passAck(absorbed bool) {
 }
 
 func (tx *ServerTx) passResp() error {
+	tx.fsmRespPassed = true
 	lastResp := tx.fsmResp
 
 	if lastResp == nil {

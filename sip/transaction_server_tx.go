@@ -21,6 +21,9 @@ type ServerTx struct {
 	timer_1xx    *time.Timer
 	timer_l      *time.Timer
 	reliable     bool
+	// fsmRespPassed records that passResp ran, which every state taking a
+	// response does. It is guarded by fsmMu, see respondUnsafe.
+	fsmRespPassed bool
 }
 
 func NewServerTx(key string, origin *Request, conn Connection, logger *slog.Logger) *ServerTx {
@@ -127,11 +130,26 @@ func (tx *ServerTx) Respond(res *Response) error {
 	// response to a non-INVITE request starts Timer J at zero, and the
 	// termination it fires must not be reported as a failure of this send.
 	tx.fsmMu.Lock()
-	tx.fsmResp = res
-	tx.spinFsmUnsafe(input)
+	tx.respondUnsafe(res, input)
 	err := tx.fsmErr
 	tx.fsmMu.Unlock()
 	return err
+}
+
+// respondUnsafe passes res to the state machine as input and reports whether
+// the state took it, which passes it to the transport. A response the state
+// refuses, such as one after a final response, is not kept: the response the
+// transaction keeps, and retransmits, stays the last one it took. It must be
+// called with fsmMu held.
+func (tx *ServerTx) respondUnsafe(res *Response, input fsmInput) bool {
+	prev := tx.fsmResp
+	tx.fsmResp, tx.fsmRespPassed = res, false
+	tx.spinFsmUnsafe(input)
+	if !tx.fsmRespPassed {
+		tx.fsmResp = prev
+		return false
+	}
+	return true
 }
 
 // respondUnlessFinalized sends res, a 300+ response, only when no final
@@ -152,9 +170,7 @@ func (tx *ServerTx) respondUnlessFinalized(res *Response) bool {
 	if tx.fsmResp != nil && !tx.fsmResp.IsProvisional() {
 		return false
 	}
-	tx.fsmResp = res
-	tx.spinFsmUnsafe(server_input_user_300_plus)
-	return true
+	return tx.respondUnsafe(res, server_input_user_300_plus)
 }
 
 // Acks makes channel for sending acks. Channel is created on demand

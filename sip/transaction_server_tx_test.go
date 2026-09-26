@@ -5,6 +5,8 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -409,4 +411,105 @@ func TestServerTransactionTerminateStopsTimerL(t *testing.T) {
 	if timerL != nil {
 		assert.False(t, timerL.Stop(), "Timer L is still pending after the transaction ended")
 	}
+}
+
+// datagramRecorder records each datagram written to it.
+type datagramRecorder struct {
+	mu        sync.Mutex
+	datagrams []string
+}
+
+func (r *datagramRecorder) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.datagrams = append(r.datagrams, string(p))
+	return len(p), nil
+}
+
+// startLines returns the start line of each datagram recorded.
+func (r *datagramRecorder) startLines() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	lines := make([]string, len(r.datagrams))
+	for i, d := range r.datagrams {
+		lines[i], _, _ = strings.Cut(d, "\r\n")
+	}
+	return lines
+}
+
+// TestServerTransactionKeepsResponseItTook passes a transaction a response its
+// state refuses, after a final one. The refused response is not sent, and it is
+// not kept either: the response the transaction keeps, retransmits and judges
+// itself finalized by is the one it took.
+func TestServerTransactionKeepsResponseItTook(t *testing.T) {
+	newTx := func(t *testing.T, req *Request) (*ServerTx, *datagramRecorder) {
+		t.Helper()
+		rec := &datagramRecorder{}
+		conn := &UDPConnection{
+			PacketConn: &fakes.UDPConn{
+				Writers: map[string]io.Writer{"127.0.0.2:5060": rec},
+			},
+		}
+		tx := NewServerTx("123", req, conn, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		require.NoError(t, tx.Init())
+		t.Cleanup(tx.Terminate)
+		return tx, rec
+	}
+
+	t.Run("InviteCompletedRefuses2xx", func(t *testing.T) {
+		req, _, _ := testCreateInvite(t, "sip:127.0.0.99:5060", "udp", "127.0.0.2:5060")
+		tx, rec := newTx(t, req)
+		require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusBusyHere, "Busy Here", nil)))
+		require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusOK, "OK", nil)))
+		require.NoError(t, compareFunctions(tx.currentFsmState(), tx.inviteStateCompleted))
+
+		// A retransmitted INVITE is answered with the response kept.
+		require.NoError(t, tx.Receive(req))
+		lines := rec.startLines()
+		require.GreaterOrEqual(t, len(lines), 2)
+		for _, line := range lines {
+			assert.Equal(t, "SIP/2.0 486 Busy Here", line)
+		}
+	})
+
+	t.Run("InviteAcceptedRefusesFinal", func(t *testing.T) {
+		req, _, _ := testCreateInvite(t, "sip:127.0.0.99:5060", "udp", "127.0.0.2:5060")
+		tx, _ := newTx(t, req)
+		res200 := NewResponseFromRequest(req, StatusOK, "OK", nil)
+		require.NoError(t, tx.Respond(res200))
+		require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusBusyHere, "Busy Here", nil)))
+		require.NoError(t, compareFunctions(tx.currentFsmState(), tx.inviteStateAccepted))
+
+		tx.fsmMu.Lock()
+		kept := tx.fsmResp
+		tx.fsmMu.Unlock()
+		assert.Same(t, res200, kept)
+	})
+
+	t.Run("InviteAcceptedRefuses1xx", func(t *testing.T) {
+		req, _, _ := testCreateInvite(t, "sip:127.0.0.99:5060", "udp", "127.0.0.2:5060")
+		tx, _ := newTx(t, req)
+		require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusOK, "OK", nil)))
+		require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusRinging, "Ringing", nil)))
+
+		// A finalized transaction over UDP is retained for its timers.
+		tx.TerminateGracefully()
+		select {
+		case <-tx.Done():
+			t.Fatal("a transaction that sent its 2xx ended on a graceful termination")
+		default:
+		}
+	})
+
+	t.Run("NonInviteCompletedRefusesFinal", func(t *testing.T) {
+		req := testCreateRequest(t, "BYE", "sip:127.0.0.99:5060", "UDP", "127.0.0.2:5060")
+		tx, rec := newTx(t, req)
+		require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusOK, "OK", nil)))
+		require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusInternalServerError, "Internal Server Error", nil)))
+		require.NoError(t, compareFunctions(tx.currentFsmState(), tx.stateCompleted))
+
+		// A retransmitted BYE is answered with the response kept.
+		require.NoError(t, tx.Receive(req))
+		assert.Equal(t, []string{"SIP/2.0 200 OK", "SIP/2.0 200 OK"}, rec.startLines())
+	})
 }
