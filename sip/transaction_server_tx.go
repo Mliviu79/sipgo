@@ -301,6 +301,10 @@ func (tx *ServerTx) delete(err error) bool {
 		tx.timer_1xx.Stop()
 		tx.timer_1xx = nil
 	}
+	if tx.timer_l != nil {
+		tx.timer_l.Stop()
+		tx.timer_l = nil
+	}
 
 	key := tx.key
 	onterm := tx.onTerminate

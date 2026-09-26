@@ -386,3 +386,27 @@ func TestServerTransactionReleasesConnRef(t *testing.T) {
 
 	require.Equal(t, 1, conn.Ref(0), "Terminate must release exactly one connection reference")
 }
+
+// TestServerTransactionTerminateStopsTimerL ends an INVITE transaction in the
+// Accepted state, where Timer L runs for 64*T1. Ending it stops Timer L, which
+// otherwise stays pending, and keeps the ended transaction reachable, for up to
+// 64*T1.
+func TestServerTransactionTerminateStopsTimerL(t *testing.T) {
+	tx, req, _ := newTestInviteServerTx(t, 10*time.Second)
+	require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusOK, "OK", nil)))
+	require.NoError(t, compareFunctions(tx.currentFsmState(), tx.inviteStateAccepted))
+
+	tx.Terminate()
+	select {
+	case <-tx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the transaction did not end")
+	}
+
+	tx.mu.Lock()
+	timerL := tx.timer_l
+	tx.mu.Unlock()
+	if timerL != nil {
+		assert.False(t, timerL.Stop(), "Timer L is still pending after the transaction ended")
+	}
+}
