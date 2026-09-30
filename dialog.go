@@ -158,24 +158,41 @@ func (d *Dialog) authorizedCopy(req *sip.Request, res *sip.Response) (*sip.Reque
 }
 
 // waitFinal waits within ctx for the final response to the request of tx,
-// passing over provisionals, and terminates tx.
+// passing over provisionals, and terminates tx. A transaction that ends before
+// a final, as one terminated with its UA does, or whose Responses channel
+// closes, returns an error: see endedWithoutFinal. A nil response is never
+// returned with a nil error.
 func waitFinal(ctx context.Context, tx sip.ClientTransaction) (*sip.Response, error) {
 	defer tx.Terminate()
 	for {
 		select {
 		case res := <-tx.Responses():
+			// A closed channel gives a nil response, which is no final.
+			if res == nil {
+				return nil, endedWithoutFinal(tx)
+			}
 			if res.IsProvisional() {
 				continue
 			}
 			return res, nil
 
 		case <-tx.Done():
-			return nil, tx.Err()
+			return nil, endedWithoutFinal(tx)
 
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
 	}
+}
+
+// endedWithoutFinal returns the error of tx, which ended before a final
+// response: the error tx ended with, or sip.ErrTransactionTerminated when it
+// names none, as when it is terminated and asked before it records why.
+func endedWithoutFinal(tx sip.ClientTransaction) error {
+	if err := tx.Err(); err != nil {
+		return err
+	}
+	return sip.ErrTransactionTerminated
 }
 
 // Init setups dialog state
