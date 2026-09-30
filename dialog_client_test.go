@@ -151,9 +151,20 @@ func TestDialogClientMultiRequest(t *testing.T) {
 
 func TestDialogClientMultiResponses(t *testing.T) {
 
-	t.Run("ProvisionalLoop", func(t *testing.T) {
-		client := testClient(t, func(req *sip.Request) *sip.Response {
-			return sip.NewResponseFromRequest(req, 100, "Trying", nil)
+	// A peer may send any number of provisionals before its final: a UAS
+	// repeats its 180 while a call rings for long (RFC 3261 section
+	// 13.3.1.1), and the client transaction passes each one up (section
+	// 17.1.1.2). None of them ends the wait; the final that follows them
+	// answers it.
+	t.Run("ProvisionalsNeverEndTheWait", func(t *testing.T) {
+		const provisionals = 12
+		responded := make(chan struct{})
+		client := testClientResponder(t, func(req *sip.Request, w *siptest.ClientTxResponder) {
+			defer close(responded)
+			for range provisionals {
+				w.Receive(sip.NewResponseFromRequest(req, sip.StatusRinging, "Ringing", nil))
+			}
+			w.Receive(sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil))
 		})
 
 		dua := DialogUA{
@@ -161,14 +172,17 @@ func TestDialogClientMultiResponses(t *testing.T) {
 		}
 		d, err := dua.Invite(context.TODO(), sip.Uri{User: "test", Host: "localhost"}, nil)
 		require.NoError(t, err)
-		go func() {
-			// Receive more provisional
-			for i := 0; i < 10; i++ {
-				d.inviteTx.(*sip.ClientTx).Receive(sip.NewResponseFromRequest(d.InviteRequest, 100, "Trying", nil))
-			}
-		}()
 		err = d.WaitAnswer(context.TODO(), AnswerOptions{})
-		require.Error(t, err)
+		// Ends the transaction, so a response the wait left unread does not
+		// hold the responder.
+		d.inviteTx.Terminate()
+		select {
+		case <-responded:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the responder did not return")
+		}
+		require.NoError(t, err, "the wait ended after %d provisionals", provisionals)
+		assert.Equal(t, sip.StatusOK, d.InviteResponse.StatusCode)
 	})
 	t.Run("ProxyAuthLoop", func(t *testing.T) {
 		var sentReq *sip.Request
