@@ -390,3 +390,152 @@ func TestDialogByeEndsSessionWhenSent(t *testing.T) {
 		})
 	}
 }
+
+// unansweredTx is a client transaction that ends before any final response:
+// end closes its Done with no error, as a transaction terminated with its UA
+// may end, or closes its Responses channel.
+type unansweredTx struct {
+	responses chan *sip.Response
+	done      chan struct{}
+}
+
+func newUnansweredTx() *unansweredTx {
+	return &unansweredTx{responses: make(chan *sip.Response), done: make(chan struct{})}
+}
+
+func (tx *unansweredTx) Terminate()                             {}
+func (tx *unansweredTx) OnTerminate(sip.FnTxTerminate) bool     { return false }
+func (tx *unansweredTx) Done() <-chan struct{}                  { return tx.done }
+func (tx *unansweredTx) Err() error                             { return nil }
+func (tx *unansweredTx) Responses() <-chan *sip.Response        { return tx.responses }
+func (tx *unansweredTx) OnRetransmission(sip.FnTxResponse) bool { return false }
+
+// unansweredResult is what a request sent inside the dialog returned, or the
+// value it panicked with.
+type unansweredResult struct {
+	res      *sip.Response
+	err      error
+	panicked any
+}
+
+// TestDialogRequestWithoutFinalIsAnError sends a BYE, and a re-INVITE through
+// Do, on each side of a confirmed dialog, on a client transaction that ends
+// before any final response, as one terminated with its UA at shutdown does.
+// A transaction that ends with no final gave the request no answer (RFC 3261
+// section 17.1), so the request returns an error, sip.ErrTransactionTerminated
+// when the transaction names none, and never a nil response with a nil error.
+func TestDialogRequestWithoutFinalIsAnError(t *testing.T) {
+	endings := []struct {
+		name string
+		end  func(tx *unansweredTx)
+	}{
+		{name: "its Done closes with no error", end: func(tx *unansweredTx) { close(tx.done) }},
+		{name: "its Responses channel closes", end: func(tx *unansweredTx) { close(tx.responses) }},
+	}
+	sides := []struct {
+		name string
+		// newConfirmed returns a confirmed dialog whose requests inside it
+		// are sent on tx, with its Bye and Do.
+		newConfirmed func(t *testing.T, tx *unansweredTx) (*Dialog, func(context.Context) error, func(context.Context, *sip.Request) (*sip.Response, error))
+	}{
+		{
+			name: "UAS",
+			newConfirmed: func(t *testing.T, tx *unansweredTx) (*Dialog, func(context.Context) error, func(context.Context, *sip.Request) (*sip.Response, error)) {
+				ua, err := NewUA()
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = ua.Close() })
+				cli, err := NewClient(ua)
+				require.NoError(t, err)
+				cli.TxRequester = clientTxRequesterFunc(func(ctx context.Context, req *sip.Request) (sip.ClientTransaction, error) {
+					return tx, nil
+				})
+				dialogSrv := NewDialogServerCache(cli, sip.ContactHeader{
+					Address: sip.Uri{User: "test", Host: "127.0.0.200", Port: 5099},
+				})
+				invite, _, _ := createTestInvite(t, "sip:uas@127.0.0.1", "udp", "127.0.0.1:5090")
+				invite.AppendHeader(&sip.ContactHeader{Address: sip.Uri{Host: "uas", Port: 1234}})
+				inviteTx := siptest.NewServerTxRecorder(invite)
+				t.Cleanup(inviteTx.Terminate)
+				d, err := dialogSrv.ReadInvite(invite, inviteTx)
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = d.Close() })
+				d.InviteResponse = sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil)
+				d.setState(sip.DialogStateConfirmed)
+				return &d.Dialog, d.Bye, d.Do
+			},
+		},
+		{
+			name: "UAC",
+			newConfirmed: func(t *testing.T, tx *unansweredTx) (*Dialog, func(context.Context) error, func(context.Context, *sip.Request) (*sip.Response, error)) {
+				ua, err := NewUA()
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = ua.Close() })
+				cli, err := NewClient(ua)
+				require.NoError(t, err)
+				answer := &siptest.ClientTxRequesterResponder{OnRequest: newByeInFlight().respond}
+				cli.TxRequester = clientTxRequesterFunc(func(ctx context.Context, req *sip.Request) (sip.ClientTransaction, error) {
+					switch {
+					case req.IsAck():
+						return nil, nil
+					case req.IsInvite() && !req.To().Params.Has("tag"):
+						return answer.Request(ctx, req)
+					}
+					return tx, nil
+				})
+				dua := DialogUA{
+					Client:     cli,
+					ContactHDR: sip.ContactHeader{Address: sip.Uri{User: "uac", Host: "127.0.0.1", Port: 5060}},
+				}
+				d, err := dua.Invite(context.TODO(), sip.Uri{User: "test", Host: "localhost"}, nil)
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = d.Close() })
+				require.NoError(t, d.WaitAnswer(context.TODO(), AnswerOptions{}))
+				require.NoError(t, d.Ack(context.TODO()))
+				return &d.Dialog, d.Bye, d.Do
+			},
+		},
+	}
+
+	for _, side := range sides {
+		t.Run(side.name, func(t *testing.T) {
+			for _, ending := range endings {
+				for _, method := range []sip.RequestMethod{sip.BYE, sip.INVITE} {
+					t.Run(method.String()+" when "+ending.name, func(t *testing.T) {
+						tx := newUnansweredTx()
+						d, bye, do := side.newConfirmed(t, tx)
+						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+						defer cancel()
+
+						sent := make(chan unansweredResult, 1)
+						go func() {
+							var got unansweredResult
+							defer func() {
+								got.panicked = recover()
+								sent <- got
+							}()
+							if method == sip.BYE {
+								got.err = bye(ctx)
+								return
+							}
+							got.res, got.err = do(ctx, sip.NewRequest(sip.INVITE, d.InviteRequest.Recipient))
+						}()
+						ending.end(tx)
+
+						var got unansweredResult
+						select {
+						case got = <-sent:
+						case <-time.After(5 * time.Second):
+							t.Fatalf("the %s did not return after its transaction ended", method)
+						}
+						require.Nil(t, got.panicked, "the %s panicked", method)
+						require.ErrorIs(t, got.err, sip.ErrTransactionTerminated)
+						assert.Nil(t, got.res)
+						if method == sip.BYE {
+							assert.Equal(t, sip.DialogStateEnded, d.LoadState())
+						}
+					})
+				}
+			}
+		})
+	}
+}
