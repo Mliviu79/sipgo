@@ -273,13 +273,12 @@ func (s *DialogClientSession) WaitAnswer(ctx context.Context, opts AnswerOptions
 	var r *sip.Response
 	var err error
 	// Counts challenges answered on this INVITE, shared by both arms so that a
-	// 407 followed by a 401 consumes both attempts.
+	// 407 followed by a 401 consumes both attempts. Only challenges are
+	// bounded, by maxAuthAttempts: a peer may send any number of provisionals
+	// before its final (RFC 3261 section 13.3.1.1), and every other response
+	// ends the wait.
 	authAttempts := 0
-	for i := 0; ; i++ {
-		if i > 10 {
-			// Preventing some long loops
-			return fmt.Errorf("more than 10 responses received")
-		}
+	for {
 		select {
 		case r = <-tx.Responses():
 			s.InviteResponse = r
