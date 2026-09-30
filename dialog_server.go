@@ -52,28 +52,15 @@ func (s *DialogServerSession) ReadBye(req *sip.Request, tx sip.ServerTransaction
 	return err
 }
 
-// Do does request response pattern. For more control over transaction use TransactionRequest
+// Do does request response pattern and returns the final response. A
+// challenge the dialog's credentials answer is answered once, see
+// SetCredentials. For more control over transaction use TransactionRequest
 func (s *DialogServerSession) Do(ctx context.Context, req *sip.Request) (*sip.Response, error) {
 	tx, err := s.TransactionRequest(ctx, req)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Terminate()
-	for {
-		select {
-		case res := <-tx.Responses():
-			if res.IsProvisional() {
-				continue
-			}
-			return res, nil
-
-		case <-tx.Done():
-			return nil, tx.Err()
-
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
+	return s.finalAnswer(ctx, s.ua.Client, req, tx)
 }
 
 // TransactionRequest is doing client DIALOG request based on RFC
@@ -422,9 +409,11 @@ func (s *DialogServerSession) Bye(ctx context.Context) error {
 }
 
 // WriteBye sends bye, once the ACK to our 2xx is read or the INVITE
-// transaction has timed out, and waits within ctx for its answer. The dialog
-// ends as soon as bye is passed to its client transaction (RFC 3261 section
-// 15.1.1), whatever the answer.
+// transaction has timed out, and waits within ctx for its final answer,
+// passing over provisionals (RFC 3261 section 17.1.2.2). A challenge the
+// dialog's credentials answer is answered once, as Do does. The dialog ends as
+// soon as bye is passed to its client transaction (RFC 3261 section 15.1.1),
+// whatever the answer.
 func (s *DialogServerSession) WriteBye(ctx context.Context, bye *sip.Request) error {
 	state := s.state.Load()
 	// In case dialog terminated
@@ -473,22 +462,17 @@ func (s *DialogServerSession) WriteBye(ctx context.Context, bye *sip.Request) er
 	if err != nil {
 		return err
 	}
-	defer tx.Terminate() // Terminates current transaction
 	ctx, cancel := s.endOnBye(ctx)
 	defer cancel()
 
-	// Wait 200
-	select {
-	case res := <-tx.Responses():
-		if res.StatusCode != 200 {
-			return ErrDialogResponse{res}
-		}
-		return nil
-	case <-tx.Done():
-		return tx.Err()
-	case <-ctx.Done():
-		return ctx.Err()
+	answer, err := s.finalAnswer(ctx, s.ua.Client, bye, tx)
+	if err != nil {
+		return err
 	}
+	if answer.StatusCode != 200 {
+		return ErrDialogResponse{answer}
+	}
+	return nil
 }
 
 // DialogServerCache serves as quick way to start building dialog server

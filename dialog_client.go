@@ -45,7 +45,8 @@ func (s *DialogClientSession) ReadBye(req *sip.Request, tx sip.ServerTransaction
 	return nil
 }
 
-// Do sends request and waits final response using Dialog rules
+// Do sends request and waits final response using Dialog rules. A challenge
+// the dialog's credentials answer is answered once, see SetCredentials.
 // For more control use TransactionRequest
 //
 // NOTE:
@@ -56,22 +57,7 @@ func (s *DialogClientSession) Do(ctx context.Context, req *sip.Request) (*sip.Re
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Terminate()
-	for {
-		select {
-		case res := <-tx.Responses():
-			if res.IsProvisional() {
-				continue
-			}
-			return res, nil
-
-		case <-tx.Done():
-			return nil, tx.Err()
-
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
+	return s.finalAnswer(ctx, s.UA.Client, req, tx)
 }
 
 // TransactionRequest is doing subsequent client DIALOG request based on RFC after initial session (INVITE) setup
@@ -546,9 +532,11 @@ func (s *DialogClientSession) Bye(ctx context.Context) error {
 	return s.WriteBye(ctx, bye)
 }
 
-// WriteBye sends bye and waits within ctx for its answer. The dialog ends as
-// soon as bye is passed to its client transaction (RFC 3261 section 15.1.1),
-// whatever the answer.
+// WriteBye sends bye and waits within ctx for its final answer, passing over
+// provisionals (RFC 3261 section 17.1.2.2). A challenge the dialog's
+// credentials answer is answered once, as Do does. The dialog ends as soon as
+// bye is passed to its client transaction (RFC 3261 section 15.1.1), whatever
+// the answer.
 func (s *DialogClientSession) WriteBye(ctx context.Context, bye *sip.Request) error {
 	defer s.Close()
 
@@ -569,22 +557,17 @@ func (s *DialogClientSession) WriteBye(ctx context.Context, bye *sip.Request) er
 		return err
 	}
 	defer s.inviteTx.Terminate() // Terminates INVITE in all cases
-	defer tx.Terminate()         // Terminates current transaction
 	ctx, cancel := s.endOnBye(ctx)
 	defer cancel()
 
-	// Wait 200
-	select {
-	case res := <-tx.Responses():
-		if res.StatusCode != 200 {
-			return ErrDialogResponse{res}
-		}
-		return nil
-	case <-tx.Done():
-		return tx.Err()
-	case <-ctx.Done():
-		return ctx.Err()
+	answer, err := s.finalAnswer(ctx, s.UA.Client, bye, tx)
+	if err != nil {
+		return err
 	}
+	if answer.StatusCode != 200 {
+		return ErrDialogResponse{answer}
+	}
+	return nil
 }
 
 func (s *DialogClientSession) isEarlyDialog() bool {

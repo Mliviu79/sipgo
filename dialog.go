@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 
 	"github.com/emiago/sipgo/sip"
+	"github.com/icholy/digest"
 )
 
 var (
@@ -72,6 +73,109 @@ type Dialog struct {
 	cancel context.CancelCauseFunc
 
 	onStatePointer atomic.Pointer[DialogStateFn]
+
+	// credentials answer a challenge to a request sent inside the dialog.
+	// They are nil until SetCredentials is called.
+	credentials atomic.Pointer[DigestAuth]
+}
+
+// SetCredentials sets the credentials that answer a challenge to a request
+// sent inside this dialog. It is safe for concurrent use.
+func (d *Dialog) SetCredentials(auth DigestAuth) {
+	d.credentials.Store(&auth)
+}
+
+// Credentials returns the credentials SetCredentials set, and whether it was
+// called. It is safe for concurrent use.
+func (d *Dialog) Credentials() (DigestAuth, bool) {
+	auth := d.credentials.Load()
+	if auth == nil {
+		return DigestAuth{}, false
+	}
+	return *auth, true
+}
+
+// finalAnswer waits within ctx for the final response to req, sent by c on
+// tx, passing over provisionals. When that final is a 401 carrying
+// WWW-Authenticate or a 407 carrying Proxy-Authenticate and the dialog holds
+// credentials, req is sent once more, on a new transaction of the dialog with
+// its next CSeq and the credentials answering the challenge (RFC 3261 sections
+// 8.1.3.5, 22.2 and 22.3), and the final of that copy is returned. A second
+// challenge is the credentials refused, and is returned as the final, as is a
+// challenge the credentials cannot answer, such as one for an algorithm the
+// digest does not support.
+func (d *Dialog) finalAnswer(ctx context.Context, c *Client, req *sip.Request, tx sip.ClientTransaction) (*sip.Response, error) {
+	res, err := waitFinal(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	retry, err := d.authorizedCopy(req, res)
+	if err != nil {
+		c.log.Warn("Cannot answer the challenge to a request inside the dialog", "method", req.Method, "status", res.StatusCode, "error", err)
+		return res, nil
+	}
+	if retry == nil {
+		return res, nil
+	}
+	tx, err = c.TransactionRequest(ctx, retry, ClientRequestAddVia)
+	if err != nil {
+		return nil, err
+	}
+	return waitFinal(ctx, tx)
+}
+
+// authorizedCopy returns a copy of req, which res answered, that answers the
+// challenge res carries with the dialog's credentials, with no Via and with
+// the dialog's next CSeq. It returns nil when res carries no challenge or the
+// dialog holds no credentials.
+func (d *Dialog) authorizedCopy(req *sip.Request, res *sip.Response) (*sip.Request, error) {
+	auth, ok := d.Credentials()
+	if !ok {
+		return nil, nil
+	}
+	var apply func(*sip.Request, *sip.Response, digest.Options) error
+	switch {
+	case res.StatusCode == sip.StatusUnauthorized && res.GetHeader("WWW-Authenticate") != nil:
+		apply = digestAuthApply
+	case res.StatusCode == sip.StatusProxyAuthRequired && res.GetHeader("Proxy-Authenticate") != nil:
+		apply = digestProxyAuthApply
+	default:
+		return nil, nil
+	}
+
+	retry := req.Clone()
+	retry.RemoveHeader("Via")
+	if err := apply(retry, res, digest.Options{
+		Method:   retry.Method.String(),
+		URI:      retry.Recipient.Addr(),
+		Username: auth.Username,
+		Password: auth.Password,
+	}); err != nil {
+		return nil, err
+	}
+	retry.CSeq().SeqNo = d.lastCSeqNo.Add(1)
+	return retry, nil
+}
+
+// waitFinal waits within ctx for the final response to the request of tx,
+// passing over provisionals, and terminates tx.
+func waitFinal(ctx context.Context, tx sip.ClientTransaction) (*sip.Response, error) {
+	defer tx.Terminate()
+	for {
+		select {
+		case res := <-tx.Responses():
+			if res.IsProvisional() {
+				continue
+			}
+			return res, nil
+
+		case <-tx.Done():
+			return nil, tx.Err()
+
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 }
 
 // Init setups dialog state
