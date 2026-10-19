@@ -366,7 +366,7 @@ func (d *Dialog) endOnBye(ctx context.Context) (context.Context, context.CancelF
 }
 
 // Err returns error that caused dialog termination
-func (d *Dialog) err() error {
+func (d *Dialog) Err() error {
 	return context.Cause(d.Context())
 }
 

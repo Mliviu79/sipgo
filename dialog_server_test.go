@@ -95,7 +95,7 @@ func TestDialogServerTransactionCanceled(t *testing.T) {
 		// Context dialog will be terminated and in this case
 		// cause of context cancelation could be found
 		<-d.Context().Done()
-		require.ErrorIs(t, d.err(), sip.ErrTransactionCanceled)
+		require.ErrorIs(t, d.Err(), sip.ErrTransactionCanceled)
 	})
 
 	t.Run("TerminatedByCancelBeforeReadingInvite", func(t *testing.T) {
