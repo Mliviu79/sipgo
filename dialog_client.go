@@ -268,7 +268,23 @@ const maxAuthAttempts = 2
 // - ErrAuthMaxRetry when the peer keeps challenging past maxAuthAttempts
 // - ErrAnsweredAfterCancel when a 2xx answers the INVITE after ctx has ended, with the dialog established
 // - any internal in case waiting answer failed for different reasons
+//
+// The CANCEL is sent once ctx has ended, so it runs on a context that does not
+// end with ctx, bounded by the CANCEL transaction's Timer F and by the 64*T1
+// wait for the INVITE's final that follows it. Use WaitAnswerWithCancelContext
+// to have the CANCEL's wait end with a context of the caller's.
 func (s *DialogClientSession) WaitAnswer(ctx context.Context, opts AnswerOptions) error {
+	return s.WaitAnswerWithCancelContext(ctx, context.WithoutCancel(ctx), opts)
+}
+
+// WaitAnswerWithCancelContext is WaitAnswer, sending the CANCEL that ctx's end
+// makes on cancelCtx, which outlives ctx, such as the context of the owner of
+// the call the INVITE attempts. The CANCEL waits for its answer within its
+// transaction's Timer F, and then for the INVITE's final within 64*T1 (RFC 3261
+// section 9.1). When cancelCtx ends first, the wait ends: the INVITE
+// transaction is terminated, and the error returned wraps both ctx's error and
+// cancelCtx's cause.
+func (s *DialogClientSession) WaitAnswerWithCancelContext(ctx, cancelCtx context.Context, opts AnswerOptions) error {
 	tx, inviteRequest := s.inviteTx, s.InviteRequest
 	var r *sip.Response
 	var err error
@@ -289,7 +305,7 @@ func (s *DialogClientSession) WaitAnswer(ctx context.Context, opts AnswerOptions
 			// https://datatracker.ietf.org/doc/html/rfc3261#section-9.1
 			// Cancel can only be sent when provisional is received
 			// We will wait until transaction timeous out (TimerB)
-			err := s.inviteCancel(ctx, tx)
+			err := s.inviteCancel(ctx, cancelCtx, tx)
 			// A 2xx answered the INVITE regardless: its transaction is kept, so
 			// its retransmissions reach the ACK the caller sends.
 			var answered *ErrAnsweredAfterCancel
@@ -428,7 +444,15 @@ func (s *DialogClientSession) answeredAfterCancel(ctx context.Context, tx sip.Cl
 	return &ErrAnsweredAfterCancel{Res: r, Err: ctx.Err()}
 }
 
-func (s *DialogClientSession) inviteCancel(ctx context.Context, tx sip.ClientTransaction) error {
+// errCancelWaitCut joins ctx's error, the end of the wait for the answer, with
+// cancelCtx's cause, the end of the CANCEL's wait.
+func errCancelWaitCut(ctx, cancelCtx context.Context) error {
+	return errors.Join(ctx.Err(), fmt.Errorf("CANCEL: %w", context.Cause(cancelCtx)))
+}
+
+// inviteCancel CANCELs the INVITE of tx, whose wait for an answer ctx ended,
+// on cancelCtx, see WaitAnswerWithCancelContext.
+func (s *DialogClientSession) inviteCancel(ctx, cancelCtx context.Context, tx sip.ClientTransaction) error {
 	if err := context.Cause(ctx); err == WaitAnswerForceCancelErr {
 		// In case caller wants to force cancelation exit.
 		return ctx.Err()
@@ -449,6 +473,8 @@ func (s *DialogClientSession) inviteCancel(ctx context.Context, tx sip.ClientTra
 			}
 		case <-tx.Done():
 			return errors.Join(fmt.Errorf("transaction terminated"), tx.Err())
+		case <-cancelCtx.Done():
+			return errCancelWaitCut(ctx, cancelCtx)
 		}
 	}
 
@@ -458,7 +484,12 @@ func (s *DialogClientSession) inviteCancel(ctx context.Context, tx sip.ClientTra
 	// 9.2), and that 2xx is still to be acknowledged.
 	cancelReq := newCancelRequest(s.InviteRequest)
 	// Cancel should grab same connection underhood
-	if _, err := s.Do(context.Background(), cancelReq); err != nil {
+	sendCtx, cancelSend := context.WithTimeout(cancelCtx, sip.Timer_F)
+	defer cancelSend()
+	if _, err := s.Do(sendCtx, cancelReq); err != nil {
+		if cancelCtx.Err() != nil {
+			return errCancelWaitCut(ctx, cancelCtx)
+		}
 		return err
 	}
 
@@ -468,6 +499,8 @@ func (s *DialogClientSession) inviteCancel(ctx context.Context, tx sip.ClientTra
 	// Terminated) response for the original request, as an RFC 2543-
 	// compliant UAS will not generate such a response.  If there is no
 	// final response for the original request in 64*T1 seconds
+	finalWait := time.NewTimer(64 * sip.T1)
+	defer finalWait.Stop()
 	for {
 		select {
 		case r = <-tx.Responses():
@@ -481,8 +514,10 @@ func (s *DialogClientSession) inviteCancel(ctx context.Context, tx sip.ClientTra
 			return ctx.Err()
 		case <-tx.Done():
 			return tx.Err()
-		case <-time.After(64 * sip.T1):
+		case <-finalWait.C:
 			return ctx.Err()
+		case <-cancelCtx.Done():
+			return errCancelWaitCut(ctx, cancelCtx)
 		}
 	}
 }

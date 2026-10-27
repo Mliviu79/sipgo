@@ -2,6 +2,7 @@ package sipgo
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync/atomic"
 	"testing"
@@ -641,4 +642,82 @@ func BenchmarkDialogDo(b *testing.B) {
 		}
 	})
 
+}
+
+// errCancelOwnerStopped is the cause a test ends the context of the CANCEL
+// with, as the owner of the call the INVITE attempts does when it stops.
+var errCancelOwnerStopped = errors.New("the call's owner stopped")
+
+// ringThenGiveUp has u ring the dialog's INVITE and returns, with the INVITE,
+// a channel WaitAnswerWithCancelContext reports on, called with a context the
+// test ends on the 180 and with cancelCtx for the CANCEL that end sends.
+func ringThenGiveUp(t *testing.T, u *rawUAS, d *DialogClientSession, cancelCtx context.Context) (rawRequest, <-chan error) {
+	t.Helper()
+	ctx, giveUp := context.WithCancel(context.Background())
+	t.Cleanup(giveUp)
+	invite := u.expect(t, sip.INVITE)
+	u.respond(t, invite, sip.StatusRinging)
+	opts := AnswerOptions{OnResponse: func(res *sip.Response) error {
+		if res.StatusCode == sip.StatusRinging {
+			giveUp()
+		}
+		return nil
+	}}
+	answered := make(chan error, 1)
+	go func() { answered <- d.WaitAnswerWithCancelContext(ctx, cancelCtx, opts) }()
+	return invite, answered
+}
+
+// TestDialogClientCancelOnCallerContext has the context WaitAnswer waits on
+// end after a 180: the CANCEL goes out (RFC 3261 section 9.1), and its wait,
+// for its answer and for the INVITE's final that follows it, runs on the
+// context the caller passed for the CANCEL, which outlives the ended one.
+func TestDialogClientCancelOnCallerContext(t *testing.T) {
+	u := newRawUAS(t)
+	d := newRawClientDialog(t, u)
+	cancelCtx := newDoneProbe(context.Background())
+	invite, answered := ringThenGiveUp(t, u, d, cancelCtx)
+
+	cancelReq := u.expect(t, sip.CANCEL)
+	u.respond(t, cancelReq, sip.StatusOK)
+	select {
+	case <-cancelCtx.called:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the CANCEL's wait did not run on the caller's context")
+	}
+	u.respond(t, invite, sip.StatusRequestTerminated)
+
+	select {
+	case err := <-answered:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(10 * time.Second):
+		t.Fatal("WaitAnswer did not return")
+	}
+	require.NotNil(t, d.InviteResponse)
+	assert.Equal(t, sip.StatusRequestTerminated, d.InviteResponse.StatusCode)
+}
+
+// TestDialogClientCancelContextCutWhileWaiting has the CANCEL's context end
+// while the CANCEL waits on a peer that answers neither it nor the INVITE:
+// WaitAnswer returns at that end, with the cause, instead of after the
+// CANCEL's Timer F and the 64*T1 wait for the INVITE's final.
+func TestDialogClientCancelContextCutWhileWaiting(t *testing.T) {
+	u := newRawUAS(t)
+	d := newRawClientDialog(t, u)
+	cancelCtx, stop := context.WithCancelCause(context.Background())
+	defer stop(nil)
+	_, answered := ringThenGiveUp(t, u, d, cancelCtx)
+
+	u.expect(t, sip.CANCEL)
+	stopAt := time.Now()
+	stop(errCancelOwnerStopped)
+
+	select {
+	case err := <-answered:
+		require.ErrorIs(t, err, context.Canceled, "the wait's own end is reported")
+		require.ErrorIs(t, err, errCancelOwnerStopped, "the CANCEL's end is reported")
+		assert.Less(t, time.Since(stopAt), sip.T1, "the CANCEL's wait must end with its context")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the CANCEL's wait outlived its context")
+	}
 }
