@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"runtime"
 	"strings"
@@ -58,6 +57,14 @@ func newServedLayer(t *testing.T, opts ...TransactionLayerOption) *servedLayer {
 // send writes one request of method to the layer and returns its Call-ID.
 func (s *servedLayer) send(t *testing.T, method string) string {
 	t.Helper()
+	callID, err := s.write(method)
+	require.NoError(t, err)
+	return callID
+}
+
+// write sends one request of method and returns its Call-ID. It reports a
+// failure as an error so a goroutine other than the test's can use it.
+func (s *servedLayer) write(method string) (string, error) {
 	callID := fmt.Sprintf("serve-%d", time.Now().UnixNano())
 	clientAddr := s.client.LocalAddr().String()
 	raw := strings.Join([]string{
@@ -71,8 +78,7 @@ func (s *servedLayer) send(t *testing.T, method string) string {
 		"", "",
 	}, "\r\n")
 	_, err := s.client.WriteTo([]byte(raw), s.serverAddr)
-	require.NoError(t, err)
-	return callID
+	return callID, err
 }
 
 // receive reads one response, or fails after the wait.
@@ -315,7 +321,8 @@ func TestServeRequestsManyRequestsWhileRunEnds(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range 10 {
-				l.send(t, "OPTIONS")
+				_, err := l.write("OPTIONS")
+				assert.NoError(t, err)
 			}
 		}()
 	}
@@ -337,10 +344,10 @@ func TestServeRequestsManyRequestsWhileRunEnds(t *testing.T) {
 // A layer nothing serves requests with, the client-only layer, keeps today's
 // behaviour: nothing is sent and the request is logged.
 func TestClientOnlyLayerAnswersNothingAndLogs(t *testing.T) {
-	capture := &logCapture{}
-	previous := DefaultLogger()
-	SetDefaultLogger(slog.New(capture))
-	t.Cleanup(func() { SetDefaultLogger(previous) })
+	// The package logger is global and goroutines of earlier tests read it: the
+	// test reads what TestMain's logger retained and swaps nothing.
+	const unhandled = "Unhandled sip request. OnRequest handler not added"
+	before := packageLog.count(unhandled)
 
 	l := newServedLayer(t)
 
@@ -348,7 +355,7 @@ func TestClientOnlyLayerAnswersNothingAndLogs(t *testing.T) {
 	_, ok := l.tryReceive(t, 500*time.Millisecond)
 	assert.False(t, ok, "a client-only layer must send nothing for a request")
 	require.Eventually(t, func() bool {
-		return capture.count("Unhandled sip request. OnRequest handler not added") == 1
+		return packageLog.count(unhandled) == before+1
 	}, 5*time.Second, 10*time.Millisecond)
 }
 

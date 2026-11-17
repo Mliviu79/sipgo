@@ -21,6 +21,9 @@ func TestMain(m *testing.M) {
 		lvl = slog.LevelInfo
 	}
 	slog.SetLogLoggerLevel(lvl)
+	// The package logger is global and goroutines of earlier tests read it, so
+	// it is installed once, before any test runs, and never swapped by one.
+	SetDefaultLogger(slog.New(&teeHandler{next: slog.Default().Handler(), capture: packageLog}))
 
 	timers := loadTimers()
 	code := m.Run()
@@ -29,6 +32,35 @@ func TestMain(m *testing.M) {
 		code = 1
 	}
 	os.Exit(code)
+}
+
+// packageLog retains every record the package logger receives during the run.
+var packageLog = &logCapture{}
+
+// teeHandler passes every record on to next and retains it in capture.
+type teeHandler struct {
+	next    slog.Handler
+	capture *logCapture
+}
+
+func (h *teeHandler) Enabled(ctx context.Context, l slog.Level) bool { return h.next.Enabled(ctx, l) }
+
+func (h *teeHandler) Handle(ctx context.Context, r slog.Record) error {
+	if err := h.capture.Handle(ctx, r); err != nil {
+		return err
+	}
+	if !h.next.Enabled(ctx, r.Level) {
+		return nil
+	}
+	return h.next.Handle(ctx, r)
+}
+
+func (h *teeHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &teeHandler{next: h.next.WithAttrs(attrs), capture: h.capture}
+}
+
+func (h *teeHandler) WithGroup(name string) slog.Handler {
+	return &teeHandler{next: h.next.WithGroup(name), capture: h.capture}
 }
 
 // testTimers are the package-wide timers, which transactions read from their
