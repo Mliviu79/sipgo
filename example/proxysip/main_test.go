@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"io"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/fakes"
 	"github.com/emiago/sipgo/sip"
 
@@ -21,6 +23,28 @@ import (
 var (
 	NRequest = flag.Int("NReq", 1000, "Change default num request")
 )
+
+// serveProxyRequests runs the requests srv reads through its handlers, as the
+// proxy's main does, until the test ends, and has the test wait for the run.
+func serveProxyRequests(t testing.TB, srv *sipgo.Server) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	ready := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = srv.ServeRequests(ctx, func() { close(ready) })
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	select {
+	case <-ready:
+	case <-done:
+		t.Fatal("the proxy's requests are not served")
+	}
+}
 
 func testCreateMessage(t testing.TB, rawMsg []string) sip.Message {
 	msg, err := sip.ParseMessage([]byte(strings.Join(rawMsg, "\r\n")))
@@ -243,6 +267,7 @@ func TestInviteCallUDP(t *testing.T) {
 
 	t.Log("Running proxy", serverAddr, client1Addr, client2Addr)
 	srv := setupSipProxy(client2Addr.String(), serverAddr.String())
+	serveProxyRequests(t, srv)
 	go srv.ServeUDP(serverC)
 	inviteScenario(t, client1, client2, p)
 
@@ -301,6 +326,7 @@ func TestInviteCallTCP(t *testing.T) {
 
 	srv := setupSipProxy(client2Addr.String(), serverAddr.String())
 
+	serveProxyRequests(t, srv)
 	go srv.ServeTCP(listener)
 	inviteScenario(t, client1, client2, p)
 }
@@ -339,6 +365,7 @@ func TestRegisterTCP(t *testing.T) {
 	listener.Conns <- serverC1
 
 	srv := setupSipProxy(client2Addr.String(), serverAddr.String())
+	serveProxyRequests(t, srv)
 	go srv.ServeTCP(listener)
 
 	reg := testCreateMessage(t, []string{
@@ -408,6 +435,7 @@ func BenchmarkInviteCall(t *testing.B) {
 	}
 
 	srv := setupSipProxy(client2Addr.String(), serverAddr.String())
+	serveProxyRequests(t, srv)
 	go srv.ServeUDP(serverC)
 	// defer srv.Shutdown()
 
