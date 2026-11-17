@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"runtime"
 	"strings"
@@ -12,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/emiago/sipgo/fakes"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -247,6 +250,41 @@ func TestUnservedRequestIsAnswered480AndAckDropped(t *testing.T) {
 		defer l.txl.serverTransactions.mu.RUnlock()
 		return len(l.txl.serverTransactions.items) == 0
 	}, 5*time.Second, 10*time.Millisecond, "the transactions of unserved requests did not end")
+}
+
+type failingWriter struct{ err error }
+
+func (w failingWriter) Write([]byte) (int, error) { return 0, w.err }
+
+// A 480 the layer cannot write is an error the existing handling of a request
+// reports once; the layer adds no line of its own for it.
+func TestUnservedRequestAnswerFailureIsReturnedNotLogged(t *testing.T) {
+	errWrite := errors.New("sip test: write failed")
+	capture := &logCapture{}
+	tpl := NewTransportLayer(net.DefaultResolver, NewParser(), nil)
+	t.Cleanup(func() { _ = tpl.Close() })
+	txl := NewTransactionLayer(tpl, WithTransactionLayerLogger(slog.New(capture)))
+	txl.OnRequest(func(ctx context.Context, req *Request, tx *ServerTx) {})
+
+	req := testCreateRequest(t, "OPTIONS", "sip:example.com", "TCP", "127.0.0.1:5060")
+	conn := &UDPConnection{
+		PacketConn: &fakes.UDPConn{
+			Reader:  strings.NewReader(""),
+			Writers: map[string]io.Writer{"127.0.0.1:5060": failingWriter{err: errWrite}},
+		},
+	}
+	conn.Ref(1)
+	tx := NewServerTx("unserved-failure", req, conn, slog.New(&logCapture{}))
+	require.NoError(t, tx.Init())
+
+	err := txl.serveRequest(req, tx)
+	require.ErrorIs(t, err, errWrite)
+	assert.Zero(t, capture.count("Failed to answer an unserved request"))
+	select {
+	case <-tx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the transaction of an unserved request did not end")
+	}
 }
 
 func TestServeRequestsServesOnce(t *testing.T) {

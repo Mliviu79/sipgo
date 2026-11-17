@@ -191,14 +191,14 @@ func (txl *TransactionLayer) ServeRequests(ctx context.Context, ready func()) er
 
 // answerUnserved is the layer's own answer to a request no run serves: 480
 // Temporarily Unavailable, or nothing for an ACK, and the transaction ends.
-func (txl *TransactionLayer) answerUnserved(req *Request, tx *ServerTx) {
-	if !req.IsAck() {
-		res := NewResponseFromRequest(req, StatusTemporarilyUnavailable, "Temporarily Unavailable", nil)
-		if err := tx.respond(res); err != nil {
-			txl.log.Error("Failed to answer an unserved request", "error", err, "tx", tx.Key())
-		}
+// It returns the failure to write the answer.
+func (txl *TransactionLayer) answerUnserved(req *Request, tx *ServerTx) error {
+	defer tx.TerminateGracefully()
+	if req.IsAck() {
+		return nil
 	}
-	tx.TerminateGracefully()
+	res := NewResponseFromRequest(req, StatusTemporarilyUnavailable, "Temporarily Unavailable", nil)
+	return tx.respond(res)
 }
 
 // OnConnectionClose is called when a reliable transport connection (TCP, TLS,
@@ -425,38 +425,36 @@ func (txl *TransactionLayer) serverTxRequest(req *Request, key string) error {
 	txl.serverTransactions.unlock()
 
 	// pass request and transaction to the serving run
-	txl.serveRequest(req, tx)
-	return nil
+	return txl.serveRequest(req, tx)
 }
 
 // serveRequest hands a request and its server transaction to the handler on
-// the ctx of the serving run, or answers it when no run serves.
-func (txl *TransactionLayer) serveRequest(req *Request, tx *ServerTx) {
+// the ctx of the serving run, or answers it when no run serves. It returns the
+// failure to write that answer.
+func (txl *TransactionLayer) serveRequest(req *Request, tx *ServerTx) error {
 	txl.runMu.Lock()
 	handler, run := txl.reqHandler, txl.run
 	txl.runMu.Unlock()
 	if handler == nil {
 		txl.unhandled(req)
-		return
+		return nil
 	}
 	if run == nil {
-		txl.answerUnserved(req, tx)
-		return
+		return txl.answerUnserved(req, tx)
 	}
 	reply := make(chan context.Context, 1)
 	select {
 	case run.enter <- reply:
 	case <-run.ended:
-		txl.answerUnserved(req, tx)
-		return
+		return txl.answerUnserved(req, tx)
 	}
 	ctx, ok := <-reply
 	if !ok {
-		txl.answerUnserved(req, tx)
-		return
+		return txl.answerUnserved(req, tx)
 	}
 	defer run.handlers.Done() // outside the recover: a recovered panic still counts the entry out
 	txl.runRequestHandler(ctx, handler, req, tx)
+	return nil
 }
 
 // runRequestHandler is where the transaction layer hands a request and its
