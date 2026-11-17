@@ -86,7 +86,7 @@ func listenerSignalingReady(ctx context.Context, l net.Listener, network string,
 }
 
 // RequestHandler is a callback that will be called on the incoming request
-type RequestHandler func(req *sip.Request, tx sip.ServerTransaction)
+type RequestHandler func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction)
 
 // Server is a SIP server
 type Server struct {
@@ -296,14 +296,24 @@ func (srv *Server) ServeWSS(l net.Listener) error {
 	return srv.tp.ServeWSS(l)
 }
 
+// ServeRequests serves the requests the user agent reads to the registered
+// handlers on ctx. A handler receives ctx as its parameter. It returns nil once
+// the user agent is closed and every handler it admitted has returned, or ctx's
+// cause when ctx ends first, after the handlers it admitted have returned.
+// Until it runs, the transaction layer answers a request 480. See
+// [sip.TransactionLayer.ServeRequests].
+func (srv *Server) ServeRequests(ctx context.Context, ready func()) error {
+	return srv.tx.ServeRequests(ctx, ready)
+}
+
 // handleRequest is handling transaction layer
-func (srv *Server) handleRequest(req *sip.Request, tx *sip.ServerTx) {
+func (srv *Server) handleRequest(ctx context.Context, req *sip.Request, tx *sip.ServerTx) {
 	for _, mid := range srv.requestMiddlewares {
 		mid(req)
 	}
 
 	handler := srv.getHandler(req.Method)
-	handler(req, tx)
+	handler(ctx, req, tx)
 	if tx != nil {
 		// Must be called to prevent any transaction leaks
 		tx.TerminateGracefully()
@@ -437,7 +447,7 @@ func (srv *Server) getHandler(method sip.RequestMethod) (handler RequestHandler)
 	return handler
 }
 
-func (srv *Server) defaultUnhandledHandler(req *sip.Request, tx sip.ServerTransaction) {
+func (srv *Server) defaultUnhandledHandler(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 	srv.log.Warn("SIP request handler not found", "method", req.Method)
 	res := sip.NewResponseFromRequest(req, 405, "Method Not Allowed", nil)
 	if err := tx.Respond(res); err != nil {

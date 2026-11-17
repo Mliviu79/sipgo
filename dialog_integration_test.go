@@ -55,7 +55,7 @@ func TestIntegrationDialog(t *testing.T) {
 	// once its handler is done with it.
 	errs := newHandlerErrors()
 	callDone := make(chan struct{}, 2)
-	srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
+	srv.OnInvite(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		dlg, err := dialogSrv.ReadInvite(req, tx)
 		if err != nil {
 			errs.report("UAS: read INVITE: %w", err)
@@ -107,7 +107,7 @@ func TestIntegrationDialog(t *testing.T) {
 		}
 	})
 
-	srv.OnAck(func(req *sip.Request, tx sip.ServerTransaction) {
+	srv.OnAck(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		if req.Recipient.Addr() != uasContact.Address.Addr() {
 			tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Not valid SIP uri", nil))
 			return
@@ -117,7 +117,7 @@ func TestIntegrationDialog(t *testing.T) {
 		}
 	})
 
-	srv.OnBye(func(req *sip.Request, tx sip.ServerTransaction) {
+	srv.OnBye(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		if req.Recipient.Addr() != uasContact.Address.Addr() {
 			tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Not valid SIP uri", nil))
 			return
@@ -147,7 +147,7 @@ func TestIntegrationDialog(t *testing.T) {
 		dialogCli := NewDialogClientCache(cli, contactHDR)
 
 		// Setup server side
-		srv.OnBye(func(req *sip.Request, tx sip.ServerTransaction) {
+		srv.OnBye(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 			if err := dialogCli.ReadBye(req, tx); err != nil {
 				errs.report("UAC: read BYE: %w", err)
 			}
@@ -155,6 +155,7 @@ func TestIntegrationDialog(t *testing.T) {
 		srv.serveRequest(func(r *sip.Request) {
 			t.Log("UAC server: ", r.StartLine())
 		})
+		serveRequests(t, srv)
 
 		// waitCall waits for the UAS to be done with the call.
 		waitCall := func(t *testing.T) {
@@ -254,7 +255,7 @@ func TestIntegrationDialogBrokenUAC(t *testing.T) {
 	// here for the test goroutine.
 	errs := newHandlerErrors()
 	defer errs.check(t)
-	srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
+	srv.OnInvite(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		dlg, err := dialogSrv.ReadInvite(req, tx)
 		if err != nil {
 			errs.report("UAS: read INVITE: %w", err)
@@ -283,7 +284,7 @@ func TestIntegrationDialogBrokenUAC(t *testing.T) {
 		}
 	})
 
-	srv.OnAck(func(req *sip.Request, tx sip.ServerTransaction) {
+	srv.OnAck(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		dialogSrv.ReadAck(req, tx)
 	})
 
@@ -307,7 +308,7 @@ func TestIntegrationDialogBrokenUAC(t *testing.T) {
 		dialogCli := NewDialogClientCache(cli, contactHDR)
 
 		// Setup server side
-		srv.OnBye(func(req *sip.Request, tx sip.ServerTransaction) {
+		srv.OnBye(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 			if err := dialogCli.ReadBye(req, tx); err != nil {
 				errs.report("UAC: read BYE: %w", err)
 			}
@@ -319,7 +320,7 @@ func TestIntegrationDialogBrokenUAC(t *testing.T) {
 		startTestServer(t, ctx, srv, contactHDR.Address.HostPort())
 
 		t.Run("UAS BYE Error", func(t *testing.T) {
-			srv.OnBye(func(req *sip.Request, tx sip.ServerTransaction) {
+			srv.OnBye(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 				tx.Respond(sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "", nil))
 			})
 			// INVITE
@@ -394,7 +395,7 @@ func TestIntegrationDialogCancel(t *testing.T) {
 	// here for the test goroutine, and closes handled when it returns.
 	errs := newHandlerErrors()
 	handled := make(chan struct{})
-	srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
+	srv.OnInvite(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		defer close(handled)
 		dlg, err := dialogSrv.ReadInvite(req, tx)
 		if err != nil {
@@ -416,7 +417,7 @@ func TestIntegrationDialogCancel(t *testing.T) {
 		}
 	})
 
-	srv.OnCancel(func(req *sip.Request, tx sip.ServerTransaction) {
+	srv.OnCancel(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		fmt.Println("Cancel received")
 	})
 
@@ -476,6 +477,9 @@ func TestIntegrationDialogCancel(t *testing.T) {
 // is in the connection pool.
 func startTestServer(t testing.TB, ctx context.Context, srv *Server, hostPort string) {
 	t.Helper()
+	runDone := make(chan error, 1)
+	go func() { runDone <- srv.ServeRequests(ctx, nil) }()
+	t.Cleanup(func() { <-runDone })
 	srvReady := make(chan struct{})
 	served := make(chan error, 1)
 	go func() {

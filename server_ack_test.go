@@ -1,6 +1,7 @@
 package sipgo
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net"
@@ -30,10 +31,11 @@ func TestServerAbsorbsAckForNonSuccessAnswer(t *testing.T) {
 	srv, err := NewServer(ua)
 	require.NoError(t, err)
 	handled := make(chan *sip.ServerTx, 1)
-	srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
+	srv.OnInvite(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBusyHere, "Busy Here", nil))
 		handled <- tx.(*sip.ServerTx)
 	})
+	serveRequests(t, srv)
 
 	serverConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	require.NoError(t, err)

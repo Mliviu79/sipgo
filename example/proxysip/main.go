@@ -67,9 +67,18 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	if err := srv.ListenAndServe(ctx, *transportType, *extIP); err != nil {
-		log.Error("Fail to start sip server", "error", err)
-		return
+	served := make(chan error, 1)
+	go func() { served <- srv.ServeRequests(ctx, nil) }()
+
+	listenErr := srv.ListenAndServe(ctx, *transportType, *extIP)
+	if err := srv.UserAgent.Close(); err != nil {
+		log.Error("Fail to close user agent", "error", err)
+	}
+	if err := <-served; err != nil && ctx.Err() == nil {
+		log.Error("Serving requests stopped", "error", err)
+	}
+	if listenErr != nil {
+		log.Error("Fail to start sip server", "error", listenErr)
 	}
 }
 
@@ -138,7 +147,7 @@ func setupSipProxy(proxydst string, ip string) *sipgo.Server {
 		}
 	}
 
-	var route = func(req *sip.Request, tx sip.ServerTransaction) {
+	var route = func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		// If we are proxying to asterisk or other proxy -dst must be set
 		// Otherwise we will look on our registration entries
 		dst := getDestination(req)
@@ -147,8 +156,6 @@ func setupSipProxy(proxydst string, ip string) *sipgo.Server {
 			reply(tx, req, 404, "Not found")
 			return
 		}
-
-		ctx := context.Background()
 
 		req.SetDestination(dst)
 		// Start client transaction and relay our request
@@ -234,7 +241,7 @@ func setupSipProxy(proxydst string, ip string) *sipgo.Server {
 		}
 	}
 
-	var registerHandler = func(req *sip.Request, tx sip.ServerTransaction) {
+	var registerHandler = func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		// https://www.rfc-editor.org/rfc/rfc3261#section-10.3
 		cont := req.Contact()
 		if cont == nil {
@@ -267,11 +274,11 @@ func setupSipProxy(proxydst string, ip string) *sipgo.Server {
 		}
 	}
 
-	var inviteHandler = func(req *sip.Request, tx sip.ServerTransaction) {
-		route(req, tx)
+	var inviteHandler = func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
+		route(ctx, req, tx)
 	}
 
-	var ackHandler = func(req *sip.Request, tx sip.ServerTransaction) {
+	var ackHandler = func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		dst := getDestination(req)
 		if dst == "" {
 			return
@@ -283,12 +290,12 @@ func setupSipProxy(proxydst string, ip string) *sipgo.Server {
 		}
 	}
 
-	var cancelHandler = func(req *sip.Request, tx sip.ServerTransaction) {
-		route(req, tx)
+	var cancelHandler = func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
+		route(ctx, req, tx)
 	}
 
-	var byeHandler = func(req *sip.Request, tx sip.ServerTransaction) {
-		route(req, tx)
+	var byeHandler = func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
+		route(ctx, req, tx)
 	}
 
 	srv.OnRegister(registerHandler)

@@ -1,6 +1,7 @@
 package sipgo
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -205,7 +206,7 @@ func TestUDPUAS(t *testing.T) {
 	// Register all handlers
 	var serverTxs []sip.ServerTransaction
 	for _, method := range allmethods {
-		srv.OnRequest(method, func(req *sip.Request, tx sip.ServerTransaction) {
+		srv.OnRequest(method, func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 			t.Log("New " + req.Method.String())
 			serverTxs = append(serverTxs, tx)
 			// Make all responses
@@ -213,6 +214,8 @@ func TestUDPUAS(t *testing.T) {
 			tx.Respond(res)
 		})
 	}
+
+	serveRequests(t, srv)
 
 	// Fire up server
 	go srv.TransportLayer().ServeUDP(serverC)
@@ -241,9 +244,9 @@ func TestUDPUAS(t *testing.T) {
 	}
 
 	// Test SIP NON allowed
-	srv.noRouteHandler = func(req *sip.Request, tx sip.ServerTransaction) {
+	srv.noRouteHandler = func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		serverTxs = append(serverTxs, tx)
-		srv.defaultUnhandledHandler(req, tx)
+		srv.defaultUnhandledHandler(ctx, req, tx)
 	}
 
 	req := createSimpleRequest("NONALLOWED", sender, recipment, "UDP")
@@ -308,7 +311,7 @@ func TestTCPUAS(t *testing.T) {
 	// Register all handlers
 	var serverTxs []sip.ServerTransaction
 	for _, method := range allmethods {
-		srv.OnRequest(method, func(req *sip.Request, tx sip.ServerTransaction) {
+		srv.OnRequest(method, func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 			t.Log("New " + req.Method.String())
 			serverTxs = append(serverTxs, tx)
 			// Make all responses
@@ -316,6 +319,8 @@ func TestTCPUAS(t *testing.T) {
 			tx.Respond(res)
 		})
 	}
+
+	serveRequests(t, srv)
 
 	// Fire up server
 	go srv.TransportLayer().ServeTCP(listener)
@@ -343,9 +348,9 @@ func TestTCPUAS(t *testing.T) {
 	}
 
 	// Test SIP NON allowed
-	srv.noRouteHandler = func(req *sip.Request, tx sip.ServerTransaction) {
+	srv.noRouteHandler = func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		serverTxs = append(serverTxs, tx)
-		srv.defaultUnhandledHandler(req, tx)
+		srv.defaultUnhandledHandler(ctx, req, tx)
 	}
 
 	req := createSimpleRequest("NONALLOWED", sender, recipment, "TCP")
@@ -451,7 +456,7 @@ func ExampleServer_OnNoRoute() {
 	ua, _ := NewUA()
 	srv, _ := NewServer(ua)
 
-	srv.OnNoRoute(func(req *sip.Request, tx sip.ServerTransaction) {
+	srv.OnNoRoute(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		res := sip.NewResponseFromRequest(req, 405, "Method Not Allowed", nil)
 		// Send response directly and let transaction terminate
 		if err := srv.WriteResponse(res); err != nil {
@@ -474,12 +479,12 @@ func TestServerHandler(t *testing.T) {
 	t.Run("registered method returns the handler that was registered", func(t *testing.T) {
 		srv := newServer(t)
 		calls := 0
-		srv.OnNotify(func(req *sip.Request, tx sip.ServerTransaction) { calls++ })
+		srv.OnNotify(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) { calls++ })
 
 		handler := srv.Handler(sip.NOTIFY)
 		require.NotNil(t, handler)
 
-		handler(nil, nil)
+		handler(testCtx(t), nil, nil)
 		assert.Equal(t, 1, calls, "the returned handler must be the registered function")
 	})
 
@@ -492,16 +497,16 @@ func TestServerHandler(t *testing.T) {
 
 	t.Run("registering twice returns the second handler", func(t *testing.T) {
 		srv := newServer(t)
-		srv.OnNotify(func(req *sip.Request, tx sip.ServerTransaction) {
+		srv.OnNotify(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 			t.Error("the overwritten handler must not be reachable")
 		})
 		secondCalls := 0
-		srv.OnNotify(func(req *sip.Request, tx sip.ServerTransaction) { secondCalls++ })
+		srv.OnNotify(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) { secondCalls++ })
 
 		handler := srv.Handler(sip.NOTIFY)
 		require.NotNil(t, handler)
 
-		handler(nil, nil)
+		handler(testCtx(t), nil, nil)
 		assert.Equal(t, 1, secondCalls, "registration is last write wins, which is what composition depends on")
 	})
 }

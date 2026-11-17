@@ -83,8 +83,8 @@ func TestServerRejectsRequestWithoutCSeq(t *testing.T) {
 			srv, err := NewServer(ua)
 			require.NoError(t, err)
 			var handled atomic.Int32
-			srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) { handled.Add(1) })
-			srv.OnOptions(func(req *sip.Request, tx sip.ServerTransaction) { handled.Add(1) })
+			srv.OnInvite(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) { handled.Add(1) })
+			srv.OnOptions(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) { handled.Add(1) })
 
 			serverConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
 			require.NoError(t, err)

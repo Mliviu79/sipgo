@@ -36,10 +36,20 @@ func TestIntegrationTransactionLayerServerTx(t *testing.T) {
 	key, _ := ServerTxKeyMake(req)
 
 	var count int32 = 0
-	txl.OnRequest(func(req *Request, tx *ServerTx) {
+	txl.OnRequest(func(_ context.Context, req *Request, tx *ServerTx) {
 		atomic.AddInt32(&count, 1)
 		t.Log("Request")
 	})
+
+	runCtx, stopRun := context.WithCancel(context.Background())
+	runReady := make(chan struct{})
+	runDone := make(chan error, 1)
+	go func() { runDone <- txl.ServeRequests(runCtx, func() { close(runReady) }) }()
+	<-runReady
+	defer func() {
+		stopRun()
+		<-runDone
+	}()
 
 	// Connection will be created
 	err := txl.handleRequest(req)
@@ -94,7 +104,7 @@ func TestTransactionLayerMalformedRequestStateless400(t *testing.T) {
 	txl := NewTransactionLayer(tp)
 
 	var handlerCalled int32
-	txl.OnRequest(func(req *Request, tx *ServerTx) {
+	txl.OnRequest(func(_ context.Context, req *Request, tx *ServerTx) {
 		atomic.AddInt32(&handlerCalled, 1)
 	})
 
@@ -298,7 +308,7 @@ func TestTransactionLayerRecoversPanickingHandler(t *testing.T) {
 	}
 	run := func(txl *TransactionLayer, req *Request, tx *ServerTx) (escaped any) {
 		defer func() { escaped = recover() }()
-		txl.runRequestHandler(req, tx)
+		txl.runRequestHandler(testCtx(t), txl.reqHandler, req, tx)
 		return nil
 	}
 	waitDone := func(t *testing.T, tx *ServerTx) {
@@ -311,7 +321,7 @@ func TestTransactionLayerRecoversPanickingHandler(t *testing.T) {
 	}
 
 	t.Run("unanswered request gets 500 and the transaction ends", func(t *testing.T) {
-		txl, capture := newLayer(t, func(req *Request, tx *ServerTx) {
+		txl, capture := newLayer(t, func(_ context.Context, req *Request, tx *ServerTx) {
 			panic(sentinel)
 		})
 		req := testCreateRequest(t, "OPTIONS", "sip:example.com", "TCP", "127.0.0.1:5060")
@@ -341,7 +351,7 @@ func TestTransactionLayerRecoversPanickingHandler(t *testing.T) {
 	})
 
 	t.Run("final response already sent is kept", func(t *testing.T) {
-		txl, _ := newLayer(t, func(req *Request, tx *ServerTx) {
+		txl, _ := newLayer(t, func(_ context.Context, req *Request, tx *ServerTx) {
 			if err := tx.Respond(NewResponseFromRequest(req, StatusOK, "OK", nil)); err != nil {
 				t.Errorf("respond 200: %v", err)
 			}
@@ -364,7 +374,7 @@ func TestTransactionLayerRecoversPanickingHandler(t *testing.T) {
 	})
 
 	t.Run("provisional only still gets 500", func(t *testing.T) {
-		txl, _ := newLayer(t, func(req *Request, tx *ServerTx) {
+		txl, _ := newLayer(t, func(_ context.Context, req *Request, tx *ServerTx) {
 			if err := tx.Respond(NewResponseFromRequest(req, StatusRinging, "Ringing", nil)); err != nil {
 				t.Errorf("respond 180: %v", err)
 			}

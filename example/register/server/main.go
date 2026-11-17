@@ -58,7 +58,7 @@ func main() {
 	// NOTE: This server only supports 1 REGISTRATION/Chalenge
 	// This needs to be rewritten in better way
 	var chal digest.Challenge
-	srv.OnRegister(func(req *sip.Request, tx sip.ServerTransaction) {
+	srv.OnRegister(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		// https://www.rfc-editor.org/rfc/rfc2617#page-6
 		h := req.GetHeader("Authorization")
 		if h == nil {
@@ -112,6 +112,17 @@ func main() {
 		tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
 	})
 	log.Info("Listening on", "addr", *extIP)
+
+	served := make(chan error, 1)
+	go func() { served <- srv.ServeRequests(ctx, nil) }()
+	defer func() {
+		if err := ua.Close(); err != nil {
+			log.Error("Failed to close user agent", "error", err)
+		}
+		if err := <-served; err != nil {
+			log.Error("Serving requests stopped", "error", err)
+		}
+	}()
 
 	go func() {
 		http.ListenAndServe(":6060", nil)

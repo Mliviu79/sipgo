@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"sync"
 	"time"
 )
 
-type TransactionRequestHandler func(req *Request, tx *ServerTx)
+// TransactionRequestHandler serves one request on the ctx of the run serving it
+// (see [TransactionLayer.ServeRequests]).
+type TransactionRequestHandler func(ctx context.Context, req *Request, tx *ServerTx)
 type UnhandledResponseHandler func(req *Response)
 type ErrorHandler func(err error)
 
@@ -18,7 +21,13 @@ type ErrorHandler func(err error)
 // the caller does not record it again.
 var errMalformedRequest = errors.New("malformed request")
 
-func defaultRequestHandler(r *Request, tx *ServerTx) {
+// ErrRequestsServed is returned by [TransactionLayer.ServeRequests] when the
+// layer is, or has been, served already.
+var ErrRequestsServed = errors.New("sip: requests are already served")
+
+// unhandled is the answer of a layer no handler was installed on, a
+// client-only layer: the request is recorded and nothing is sent.
+func (txl *TransactionLayer) unhandled(r *Request) {
 	DefaultLogger().Info("Unhandled sip request. OnRequest handler not added", "caller", "transactionLayer", "msg", r.Short())
 }
 
@@ -27,8 +36,15 @@ func defaultUnhandledRespHandler(r *Response) {
 }
 
 type TransactionLayer struct {
-	tpl           *TransportLayer
-	reqHandler    TransactionRequestHandler
+	tpl *TransportLayer
+	// runMu guards reqHandler and run.
+	runMu      sync.Mutex
+	reqHandler TransactionRequestHandler
+	run        *requestRun
+
+	closed    chan struct{}
+	closeOnce sync.Once
+
 	unRespHandler UnhandledResponseHandler
 
 	clientTransactions *transactionStore[*ClientTx]
@@ -72,7 +88,7 @@ func NewTransactionLayer(tpl *TransportLayer, options ...TransactionLayerOption)
 		clientTransactions: newTransactionStore[*ClientTx](),
 		serverTransactions: newTransactionStore[*ServerTx](),
 
-		reqHandler:    defaultRequestHandler,
+		closed:        make(chan struct{}),
 		unRespHandler: defaultUnhandledRespHandler,
 	}
 	txl.log = DefaultLogger().With("caller", "TransactionLayer")
@@ -101,8 +117,88 @@ func NewTransactionLayer(tpl *TransportLayer, options ...TransactionLayerOption)
 	return txl
 }
 
+// OnRequest installs the handler requests are served to. It takes the layer's
+// run lock, so it is safe while the layer serves.
 func (txl *TransactionLayer) OnRequest(h TransactionRequestHandler) {
+	txl.runMu.Lock()
 	txl.reqHandler = h
+	txl.runMu.Unlock()
+}
+
+// requestRun is the serving run of a layer: the gate a request passes to be
+// given the run's ctx.
+type requestRun struct {
+	enter    chan chan<- context.Context // unbuffered; each reply is buffered to one
+	ended    chan struct{}               // closed by the run when it takes no more requests
+	handlers sync.WaitGroup              // each admitted entry, Done by the entering goroutine
+}
+
+// ServeRequests serves the requests the layer reads to the handler installed
+// with OnRequest, on ctx. A request enters the run on the goroutine that read
+// it, is given ctx and is counted until its handler returns; the handler runs
+// there. ready, when not nil, is called once, on this goroutine, as soon as
+// requests are taken. ServeRequests returns nil once the layer is closed
+// (Close) and every handler it admitted has returned; when ctx ends first it
+// takes no more requests, waits for every handler it admitted and returns ctx's
+// cause. While a handler is installed and no run serves, the layer itself
+// answers a request 480 Temporarily Unavailable, with no ctx (an ACK is
+// dropped), and ends its transaction. A layer is served once: a second call
+// returns [ErrRequestsServed] at once.
+func (txl *TransactionLayer) ServeRequests(ctx context.Context, ready func()) error {
+	run := &requestRun{
+		enter: make(chan chan<- context.Context),
+		ended: make(chan struct{}),
+	}
+	txl.runMu.Lock()
+	if txl.run != nil {
+		txl.runMu.Unlock()
+		return ErrRequestsServed
+	}
+	txl.run = run
+	txl.runMu.Unlock()
+
+	if ready != nil {
+		ready()
+	}
+	// ended first: no sender waits on enter after this
+	defer func() {
+		close(run.ended)
+		run.handlers.Wait()
+	}()
+	for {
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case <-txl.closed:
+			return nil
+		case reply := <-run.enter:
+			// A request taken in the instant of the end is not served.
+			if ctx.Err() != nil {
+				close(reply)
+				return context.Cause(ctx)
+			}
+			select {
+			case <-txl.closed:
+				close(reply)
+				return nil
+			default:
+			}
+			run.handlers.Add(1) // on the goroutine that later Waits, before replying
+			reply <- ctx
+		}
+	}
+}
+
+// answerUnserved is the layer's own answer to a request no run serves: 480
+// Temporarily Unavailable, or nothing for an ACK, and the transaction ends.
+func (txl *TransactionLayer) answerUnserved(req *Request, tx *ServerTx) {
+	if !req.IsAck() {
+		res := NewResponseFromRequest(req, StatusTemporarilyUnavailable, "Temporarily Unavailable", nil)
+		if err := tx.Respond(res); err != nil {
+			txl.log.Error("Failed to answer an unserved request", "error", err, "tx", tx.Key())
+		}
+	}
+	tx.TerminateGracefully()
 }
 
 // OnConnectionClose is called when a reliable transport connection (TCP, TLS,
@@ -328,17 +424,47 @@ func (txl *TransactionLayer) serverTxRequest(req *Request, key string) error {
 	tx.OnTerminate(txl.serverTxTerminate)
 	txl.serverTransactions.unlock()
 
-	// pass request and transaction to handler
-	txl.runRequestHandler(req, tx)
+	// pass request and transaction to the serving run
+	txl.serveRequest(req, tx)
 	return nil
+}
+
+// serveRequest hands a request and its server transaction to the handler on
+// the ctx of the serving run, or answers it when no run serves.
+func (txl *TransactionLayer) serveRequest(req *Request, tx *ServerTx) {
+	txl.runMu.Lock()
+	handler, run := txl.reqHandler, txl.run
+	txl.runMu.Unlock()
+	if handler == nil {
+		txl.unhandled(req)
+		return
+	}
+	if run == nil {
+		txl.answerUnserved(req, tx)
+		return
+	}
+	reply := make(chan context.Context, 1)
+	select {
+	case run.enter <- reply:
+	case <-run.ended:
+		txl.answerUnserved(req, tx)
+		return
+	}
+	ctx, ok := <-reply
+	if !ok {
+		txl.answerUnserved(req, tx)
+		return
+	}
+	defer run.handlers.Done() // outside the recover: a recovered panic still counts the entry out
+	txl.runRequestHandler(ctx, handler, req, tx)
 }
 
 // runRequestHandler is where the transaction layer hands a request and its
 // server transaction to user code. A panic in that code is recovered here, so
 // one faulty handler costs its own transaction rather than the process.
-func (txl *TransactionLayer) runRequestHandler(req *Request, tx *ServerTx) {
+func (txl *TransactionLayer) runRequestHandler(ctx context.Context, handler TransactionRequestHandler, req *Request, tx *ServerTx) {
 	defer txl.recoverRequestHandler(req, tx)
-	txl.reqHandler(req, tx)
+	handler(ctx, req, tx)
 }
 
 // recoverRequestHandler must be deferred by runRequestHandler itself, since
@@ -527,7 +653,10 @@ func (txl *TransactionLayer) getServerTx(key string) (*ServerTx, bool) {
 	// return tx.(*ServerTx), true
 }
 
+// Close terminates the layer's transactions and ends its serving: a run
+// returns once the handlers it admitted have.
 func (txl *TransactionLayer) Close() {
+	txl.closeOnce.Do(func() { close(txl.closed) })
 	txl.clientTransactions.terminateAll()
 	txl.serverTransactions.terminateAll()
 	txl.log.Debug("transaction layer closed")

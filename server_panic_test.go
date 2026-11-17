@@ -91,20 +91,21 @@ func TestServerRecoversPanickingHandler(t *testing.T) {
 
 	srv, err := NewServer(ua)
 	require.NoError(t, err)
-	srv.OnInfo(func(req *sip.Request, tx sip.ServerTransaction) {
+	srv.OnInfo(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		panic(handlerPanicSentinel)
 	})
-	srv.OnMessage(func(req *sip.Request, tx sip.ServerTransaction) {
+	srv.OnMessage(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		if err := tx.Respond(sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)); err != nil {
 			t.Errorf("respond 200 to MESSAGE: %v", err)
 		}
 		panic(handlerPanicSentinel)
 	})
-	srv.OnOptions(func(req *sip.Request, tx sip.ServerTransaction) {
+	srv.OnOptions(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		if err := tx.Respond(sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)); err != nil {
 			t.Errorf("respond 200 to OPTIONS: %v", err)
 		}
 	})
+	serveRequests(t, srv)
 
 	serverConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	require.NoError(t, err)

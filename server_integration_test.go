@@ -119,7 +119,7 @@ func TestIntegrationClientServer(t *testing.T) {
 		srv, err := NewServer(ua)
 		require.NoError(t, err)
 
-		srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
+		srv.OnInvite(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 			res := sip.NewResponseFromRequest(req, 200, "OK", nil)
 			if err := tx.Respond(res); err != nil {
 				errs.report("respond 200: %w", err)
@@ -127,6 +127,7 @@ func TestIntegrationClientServer(t *testing.T) {
 			}
 			<-tx.Done()
 		})
+		serveRequests(t, srv)
 
 		// Trick to make sure we are listening
 		serverReady := make(chan struct{})
@@ -200,12 +201,13 @@ func TestIntegrationServerResponse(t *testing.T) {
 	srv, _ := NewServer(ua)
 
 	serverResDestination := atomic.Pointer[string]{}
-	srv.OnOptions(func(req *sip.Request, tx sip.ServerTransaction) {
+	srv.OnOptions(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		res := sip.NewResponseFromRequest(req, 200, "", nil)
 		dst := res.Destination()
 		serverResDestination.Store(&dst)
 		tx.Respond(res)
 	})
+	serveRequests(t, srv)
 
 	ludp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 15151})
 	require.NoError(t, err)
@@ -288,7 +290,7 @@ func BenchmarkIntegrationClientServer(t *testing.B) {
 		srv, err := NewServer(ua)
 		require.NoError(t, err)
 
-		srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
+		srv.OnInvite(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 			res := sip.NewResponseFromRequest(req, 200, "OK", nil)
 			if err := tx.Respond(res); err != nil {
 				errs.report("respond 200: %w", err)
@@ -296,6 +298,7 @@ func BenchmarkIntegrationClientServer(t *testing.B) {
 			}
 			<-tx.Done()
 		})
+		serveRequests(t, srv)
 
 		// Trick to make sure we are listening
 		serverReady := make(chan struct{})
