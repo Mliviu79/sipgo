@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -35,6 +36,12 @@ type TransportLayer struct {
 	dnsResolver   *net.Resolver
 
 	handlers []MessageHandler
+
+	// listeners are the listeners served by this layer, closed once by Close.
+	// listenersMu guards listeners and listenersClosed.
+	listenersMu     sync.Mutex
+	listeners       []io.Closer
+	listenersClosed bool
 
 	log *slog.Logger
 
@@ -256,6 +263,10 @@ func (l *TransportLayer) handleMessage(msg Message) {
 
 // ServeUDP will listen on udp connection
 func (l *TransportLayer) ServeUDP(c net.PacketConn) error {
+	c = NewOnceClosePacketConn(c)
+	if err := l.recordListener(c); err != nil {
+		return err
+	}
 	_, port, err := ParseAddr(c.LocalAddr().String())
 	if err != nil {
 		return err
@@ -268,6 +279,10 @@ func (l *TransportLayer) ServeUDP(c net.PacketConn) error {
 
 // ServeTCP will listen on tcp connection
 func (l *TransportLayer) ServeTCP(c net.Listener) error {
+	c = NewOnceCloseListener(c)
+	if err := l.recordListener(c); err != nil {
+		return err
+	}
 	_, port, err := ParseAddr(c.Addr().String())
 	if err != nil {
 		return err
@@ -280,6 +295,10 @@ func (l *TransportLayer) ServeTCP(c net.Listener) error {
 
 // ServeWS will listen on ws connection
 func (l *TransportLayer) ServeWS(c net.Listener) error {
+	c = NewOnceCloseListener(c)
+	if err := l.recordListener(c); err != nil {
+		return err
+	}
 	_, port, err := ParseAddr(c.Addr().String())
 	if err != nil {
 		return err
@@ -292,6 +311,10 @@ func (l *TransportLayer) ServeWS(c net.Listener) error {
 
 // ServeTLS will listen on tcp connection
 func (l *TransportLayer) ServeTLS(c net.Listener) error {
+	c = NewOnceCloseListener(c)
+	if err := l.recordListener(c); err != nil {
+		return err
+	}
 	_, port, err := ParseAddr(c.Addr().String())
 	if err != nil {
 		return err
@@ -303,6 +326,10 @@ func (l *TransportLayer) ServeTLS(c net.Listener) error {
 
 // ServeWSS will listen on wss connection
 func (l *TransportLayer) ServeWSS(c net.Listener) error {
+	c = NewOnceCloseListener(c)
+	if err := l.recordListener(c); err != nil {
+		return err
+	}
 	_, port, err := ParseAddr(c.Addr().String())
 	if err != nil {
 		return err
@@ -310,6 +337,36 @@ func (l *TransportLayer) ServeWSS(c net.Listener) error {
 	l.addListenPort("wss", port)
 
 	return l.wss.Serve(c, l.handleMessage)
+}
+
+// recordListener records c to be closed by Close. When the layer is closed
+// already, it closes c at once and returns net.ErrClosed, so a listener served
+// after Close is never left open.
+func (l *TransportLayer) recordListener(c io.Closer) error {
+	l.listenersMu.Lock()
+	if l.listenersClosed {
+		l.listenersMu.Unlock()
+		return errors.Join(net.ErrClosed, c.Close())
+	}
+	l.listeners = append(l.listeners, c)
+	l.listenersMu.Unlock()
+	return nil
+}
+
+// closeListeners closes every recorded listener, each once, and refuses the
+// ones served later.
+func (l *TransportLayer) closeListeners() error {
+	l.listenersMu.Lock()
+	listeners := l.listeners
+	l.listeners = nil
+	l.listenersClosed = true
+	l.listenersMu.Unlock()
+
+	var werr error
+	for _, c := range listeners {
+		werr = errors.Join(werr, c.Close())
+	}
+	return werr
 }
 
 func (l *TransportLayer) addListenPort(network string, port int) {
@@ -776,7 +833,8 @@ func (l *TransportLayer) getConnection(network, addr string) (Connection, error)
 
 func (l *TransportLayer) Close() error {
 	l.log.Debug("Layer is closing")
-	var werr error
+	// Stop intake first: the served listeners.
+	werr := l.closeListeners()
 	for _, t := range l.allTransports() {
 		if t == nil {
 			continue

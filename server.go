@@ -146,6 +146,29 @@ func newBaseServer(ua *UserAgent, options ...ServerOption) (*Server, error) {
 	return s, nil
 }
 
+// serveWatched runs serve, which serves listener, and closes listener when ctx
+// ends: the terminate. The watcher of ctx ends when serve returns and is joined
+// before serveWatched returns. listener closes once, whoever closes it first
+// (the transport layer at UserAgent.Close, or the watcher).
+func (srv *Server) serveWatched(ctx context.Context, listener io.Closer, serve func() error) error {
+	served := make(chan struct{})
+	watched := make(chan struct{})
+	go func() {
+		defer close(watched)
+		select {
+		case <-ctx.Done():
+			if err := listener.Close(); err != nil {
+				srv.log.Error("Failed to close listener", "error", err)
+			}
+		case <-served:
+		}
+	}()
+	err := serve()
+	close(served)
+	<-watched
+	return err
+}
+
 // Serve will fire all listeners
 // Network supported: udp, tcp, ws
 // A ready value in ctx under ListenReadyCtxKey fires once the listener is
@@ -153,15 +176,6 @@ func newBaseServer(ua *UserAgent, options ...ServerOption) (*Server, error) {
 // connection pool. It never fires if serving fails before that.
 func (srv *Server) ListenAndServe(ctx context.Context, network string, addr string) error {
 	network = strings.ToLower(network)
-
-	watchContext := func(connCloser io.Closer) {
-		select {
-		case <-ctx.Done():
-			if err := connCloser.Close(); err != nil {
-				srv.log.Error("Failed to close listener", "error", err)
-			}
-		}
-	}
 
 	switch network {
 	case "udp", "udp4", "udp6":
@@ -176,8 +190,10 @@ func (srv *Server) ListenAndServe(ctx context.Context, network string, addr stri
 			return fmt.Errorf("listen udp error. err=%w", err)
 		}
 
-		go watchContext(udpConn)
-		return srv.tp.ServeUDP(packetConnSignalingReady(ctx, udpConn, network, udpConn.LocalAddr().String()))
+		conn := sip.NewOnceClosePacketConn(udpConn)
+		return srv.serveWatched(ctx, conn, func() error {
+			return srv.tp.ServeUDP(packetConnSignalingReady(ctx, conn, network, conn.LocalAddr().String()))
+		})
 
 	case "tcp", "tcp4", "tcp6":
 		laddr, err := net.ResolveTCPAddr(network, addr)
@@ -190,8 +206,10 @@ func (srv *Server) ListenAndServe(ctx context.Context, network string, addr stri
 			return fmt.Errorf("listen tcp error. err=%w", err)
 		}
 
-		go watchContext(conn)
-		return srv.tp.ServeTCP(listenerSignalingReady(ctx, conn, network, conn.Addr().String()))
+		listener := sip.NewOnceCloseListener(conn)
+		return srv.serveWatched(ctx, listener, func() error {
+			return srv.tp.ServeTCP(listenerSignalingReady(ctx, listener, network, listener.Addr().String()))
+		})
 	case "ws", "ws4", "ws6":
 		ipv := network[2:]
 		network = "tcp" + ipv
@@ -205,9 +223,11 @@ func (srv *Server) ListenAndServe(ctx context.Context, network string, addr stri
 			return fmt.Errorf("listen tcp error. err=%w", err)
 		}
 
-		go watchContext(conn)
+		listener := sip.NewOnceCloseListener(conn)
 		// and uses listener to buffer
-		return srv.tp.ServeWS(listenerSignalingReady(ctx, conn, network, conn.Addr().String()))
+		return srv.serveWatched(ctx, listener, func() error {
+			return srv.tp.ServeWS(listenerSignalingReady(ctx, listener, network, listener.Addr().String()))
+		})
 	}
 	return sip.ErrTransportNotSuported
 }
@@ -218,17 +238,6 @@ func (srv *Server) ListenAndServe(ctx context.Context, network string, addr stri
 func (srv *Server) ListenAndServeTLS(ctx context.Context, network string, addr string, conf *tls.Config) error {
 	network = strings.ToLower(network)
 
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	watchContext := func(connCloser io.Closer) {
-		select {
-		case <-ctx.Done():
-			if err := connCloser.Close(); err != nil {
-				srv.log.Error("Failed to close listener", "error", err)
-			}
-		}
-	}
 	// Support explicitp ipv4 vs ipv6
 	tcpNetwork := "tcp"
 	switch network {
@@ -258,14 +267,14 @@ func (srv *Server) ListenAndServeTLS(ctx context.Context, network string, addr s
 			return fmt.Errorf("listen tls error. err=%w", err)
 		}
 
-		go watchContext(listener)
-		servedListener := listenerSignalingReady(ctx, listener, network, listener.Addr().String())
-
-		if network == "wss" {
-			return srv.tp.ServeWSS(servedListener)
-		}
-
-		return srv.tp.ServeTLS(servedListener)
+		closer := sip.NewOnceCloseListener(listener)
+		return srv.serveWatched(ctx, closer, func() error {
+			servedListener := listenerSignalingReady(ctx, closer, network, closer.Addr().String())
+			if network == "wss" {
+				return srv.tp.ServeWSS(servedListener)
+			}
+			return srv.tp.ServeTLS(servedListener)
+		})
 	}
 
 	return sip.ErrTransportNotSuported
