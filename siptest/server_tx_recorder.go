@@ -54,10 +54,6 @@ func (r *ServerTxRecorder) Result() []*sip.Response {
 
 // }
 
-// func (r *ServerTxRecorder) Respond(res *sip.Response) error {
-
-// }
-
 // func (r *ServerTxRecorder) Acks() <-chan *sip.Request {
 
 // }

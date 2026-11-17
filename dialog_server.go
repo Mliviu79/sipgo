@@ -186,6 +186,8 @@ func (s *DialogServerSession) Close() error {
 // 2xx for creating dialog or other code in case failure
 //
 // In case Cancel request received: ErrDialogCanceled is responded
+//
+// The response is written on ctx, as WriteResponse describes.
 func (s *DialogServerSession) Respond(ctx context.Context, statusCode int, reason string, body []byte, headers ...sip.Header) error {
 	// Must copy Record-Route headers. Done by this command
 	res := sip.NewResponseFromRequest(s.InviteRequest, statusCode, reason, body)
@@ -258,6 +260,15 @@ func (s *DialogServerSession) authDigest(ctx context.Context, chal *digest.Chall
 // established ends. Once the dialog is answered with a 2xx, that 2xx may be
 // written again, which sends it again, and any other response is refused with
 // ErrDialogAlreadyAnswered.
+//
+// ctx bounds the write and the wait for the ACK. A ctx that has ended is not
+// handed to the transaction: its cause is returned, but the response is
+// recorded as the dialog's InviteResponse and a 2xx has already set the dialog
+// Established. When ctx ends during the wait, after a non-2xx final response
+// went out, the dialog is set Ended and the cause is returned. After a 2xx the
+// dialog stays Established and the cause is returned: the caller owes the peer
+// a BYE. If the dialog ended during the wait, ErrDialogEndedBeforeAck is
+// returned, whether or not ctx is the dialog's own.
 func (s *DialogServerSession) WriteResponse(ctx context.Context, res *sip.Response) error {
 	tx := s.inviteTx
 
