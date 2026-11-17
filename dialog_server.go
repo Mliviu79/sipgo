@@ -389,6 +389,11 @@ func (s *DialogServerSession) WriteResponse(ctx context.Context, res *sip.Respon
 		case <-ackTimeout.C:
 			return s.ackTimedOut()
 		case <-ctx.Done():
+			// A ctx that is the dialog's own ends with the dialog, ahead of
+			// the state the dialog reports: the end is then the dialog's.
+			if s.LoadState() == sip.DialogStateEnded {
+				return ErrDialogEndedBeforeAck
+			}
 			return context.Cause(ctx)
 		case state = <-readStateCh:
 		}
