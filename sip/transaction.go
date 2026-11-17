@@ -116,8 +116,9 @@ type ServerTransaction interface {
 	Transaction
 
 	// Respond sends response. It is expected that is prebuilt with correct headers
-	// Use NewResponseFromRequest to build response
-	Respond(res *Response) error
+	// Use NewResponseFromRequest to build response. Once ctx has ended nothing is
+	// sent and the cause of its end is returned.
+	Respond(ctx context.Context, res *Response) error
 	// Acks returns ACK during transaction.
 	Acks() <-chan *Request
 

@@ -496,7 +496,7 @@ func TestDialogClientByeBeforeAckReturns(t *testing.T) {
 				Port:            5090,
 				Params:          params,
 			})
-			require.NoError(t, d.ReadBye(bye, siptest.NewServerTxRecorder(bye)))
+			require.NoError(t, d.ReadBye(testCtx(t), bye, siptest.NewServerTxRecorder(bye)))
 		}
 		return sip.NewResponseFromRequest(req, 200, "OK", nil)
 	})
@@ -578,7 +578,7 @@ func TestDialogClientByeOutOfOrder(t *testing.T) {
 		bye := peerRequest(d, sip.BYE, seqNo)
 		tx := siptest.NewServerTxRecorder(bye)
 		t.Cleanup(tx.Terminate)
-		err := d.ReadBye(bye, tx)
+		err := d.ReadBye(testCtx(t), bye, tx)
 		answers := tx.Result()
 		require.Len(t, answers, 1, "the BYE is answered once")
 		return err, answers[0].StatusCode

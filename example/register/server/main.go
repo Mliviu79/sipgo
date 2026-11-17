@@ -58,7 +58,7 @@ func main() {
 	// NOTE: This server only supports 1 REGISTRATION/Chalenge
 	// This needs to be rewritten in better way
 	var chal digest.Challenge
-	srv.OnRegister(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
+	srv.OnRegister(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		// https://www.rfc-editor.org/rfc/rfc2617#page-6
 		h := req.GetHeader("Authorization")
 		if h == nil {
@@ -72,21 +72,21 @@ func main() {
 			res := sip.NewResponseFromRequest(req, 401, "Unathorized", nil)
 			res.AppendHeader(sip.NewHeader("WWW-Authenticate", chal.String()))
 
-			tx.Respond(res)
+			tx.Respond(ctx, res)
 			return
 		}
 
 		cred, err := digest.ParseCredentials(h.Value())
 		if err != nil {
 			log.Error("parsing creds failed", "error", err)
-			tx.Respond(sip.NewResponseFromRequest(req, 401, "Bad credentials", nil))
+			tx.Respond(ctx, sip.NewResponseFromRequest(req, 401, "Bad credentials", nil))
 			return
 		}
 
 		// Check registry
 		passwd, exists := registry[cred.Username]
 		if !exists {
-			tx.Respond(sip.NewResponseFromRequest(req, 404, "Bad authorization header", nil))
+			tx.Respond(ctx, sip.NewResponseFromRequest(req, 404, "Bad authorization header", nil))
 			return
 		}
 
@@ -100,16 +100,16 @@ func main() {
 
 		if err != nil {
 			log.Error("Calc digest failed", "error", err)
-			tx.Respond(sip.NewResponseFromRequest(req, 401, "Bad credentials", nil))
+			tx.Respond(ctx, sip.NewResponseFromRequest(req, 401, "Bad credentials", nil))
 			return
 		}
 
 		if cred.Response != digCred.Response {
-			tx.Respond(sip.NewResponseFromRequest(req, 401, "Unathorized", nil))
+			tx.Respond(ctx, sip.NewResponseFromRequest(req, 401, "Unathorized", nil))
 			return
 		}
 		log.Info("New client registered", "username", cred.Username)
-		tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
+		tx.Respond(ctx, sip.NewResponseFromRequest(req, 200, "OK", nil))
 	})
 	log.Info("Listening on", "addr", *extIP)
 

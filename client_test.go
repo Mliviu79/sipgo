@@ -306,9 +306,9 @@ func TestIntegrationClientViaBindHost(t *testing.T) {
 		require.NoError(t, err)
 
 		startTestServer(t, ctx, srv, "127.0.0.1:15099")
-		srv.OnOptions(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
+		srv.OnOptions(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 			res := sip.NewResponseFromRequest(req, 200, "OK", nil)
-			tx.Respond(res)
+			tx.Respond(ctx, res)
 		})
 	}
 

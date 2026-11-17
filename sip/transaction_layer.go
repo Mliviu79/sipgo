@@ -194,7 +194,7 @@ func (txl *TransactionLayer) ServeRequests(ctx context.Context, ready func()) er
 func (txl *TransactionLayer) answerUnserved(req *Request, tx *ServerTx) {
 	if !req.IsAck() {
 		res := NewResponseFromRequest(req, StatusTemporarilyUnavailable, "Temporarily Unavailable", nil)
-		if err := tx.Respond(res); err != nil {
+		if err := tx.respond(res); err != nil {
 			txl.log.Error("Failed to answer an unserved request", "error", err, "tx", tx.Key())
 		}
 	}
@@ -602,7 +602,7 @@ func (txl *TransactionLayer) clientTxRequest(ctx context.Context, req *Request, 
 	return tx, nil
 }
 
-func (txl *TransactionLayer) Respond(res *Response) (*ServerTx, error) {
+func (txl *TransactionLayer) Respond(ctx context.Context, res *Response) (*ServerTx, error) {
 	key, err := ServerTxKeyMake(res)
 	if err != nil {
 		return nil, err
@@ -613,7 +613,7 @@ func (txl *TransactionLayer) Respond(res *Response) (*ServerTx, error) {
 		return nil, fmt.Errorf("transaction does not exists")
 	}
 
-	err = tx.Respond(res)
+	err = tx.Respond(ctx, res)
 	if err != nil {
 		return nil, err
 	}

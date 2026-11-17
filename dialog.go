@@ -399,12 +399,12 @@ func (d *Dialog) Context() context.Context {
 // sending the answer. RFC 3261 section 12.2.2 has such a request rejected as
 // out of order. It returns nil for a request in order, and leaves the remote
 // sequence number as it is.
-func (d *Dialog) refuseOutOfOrder(req *sip.Request, tx sip.ServerTransaction) error {
+func (d *Dialog) refuseOutOfOrder(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
 	if req.CSeq().SeqNo >= d.remoteCSeqNo.Load() {
 		return nil
 	}
 	res := sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "Internal Server Error", nil)
-	return errors.Join(ErrDialogInvalidCseq, tx.Respond(res))
+	return errors.Join(ErrDialogInvalidCseq, tx.Respond(ctx, res))
 }
 
 func (d *Dialog) ReadRequest(req *sip.Request, tx sip.ServerTransaction) error {

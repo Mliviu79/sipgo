@@ -206,12 +206,12 @@ func TestUDPUAS(t *testing.T) {
 	// Register all handlers
 	var serverTxs []sip.ServerTransaction
 	for _, method := range allmethods {
-		srv.OnRequest(method, func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
+		srv.OnRequest(method, func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 			t.Log("New " + req.Method.String())
 			serverTxs = append(serverTxs, tx)
 			// Make all responses
 			res := sip.NewResponseFromRequest(req, 200, "OK", nil)
-			tx.Respond(res)
+			tx.Respond(ctx, res)
 		})
 	}
 
@@ -311,12 +311,12 @@ func TestTCPUAS(t *testing.T) {
 	// Register all handlers
 	var serverTxs []sip.ServerTransaction
 	for _, method := range allmethods {
-		srv.OnRequest(method, func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
+		srv.OnRequest(method, func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 			t.Log("New " + req.Method.String())
 			serverTxs = append(serverTxs, tx)
 			// Make all responses
 			res := sip.NewResponseFromRequest(req, 200, "OK", nil)
-			tx.Respond(res)
+			tx.Respond(ctx, res)
 		})
 	}
 
@@ -456,7 +456,7 @@ func ExampleServer_OnNoRoute() {
 	ua, _ := NewUA()
 	srv, _ := NewServer(ua)
 
-	srv.OnNoRoute(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
+	srv.OnNoRoute(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		res := sip.NewResponseFromRequest(req, 405, "Method Not Allowed", nil)
 		// Send response directly and let transaction terminate
 		if err := srv.WriteResponse(res); err != nil {
@@ -479,7 +479,7 @@ func TestServerHandler(t *testing.T) {
 	t.Run("registered method returns the handler that was registered", func(t *testing.T) {
 		srv := newServer(t)
 		calls := 0
-		srv.OnNotify(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) { calls++ })
+		srv.OnNotify(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) { calls++ })
 
 		handler := srv.Handler(sip.NOTIFY)
 		require.NotNil(t, handler)
@@ -497,11 +497,11 @@ func TestServerHandler(t *testing.T) {
 
 	t.Run("registering twice returns the second handler", func(t *testing.T) {
 		srv := newServer(t)
-		srv.OnNotify(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
+		srv.OnNotify(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 			t.Error("the overwritten handler must not be reachable")
 		})
 		secondCalls := 0
-		srv.OnNotify(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) { secondCalls++ })
+		srv.OnNotify(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) { secondCalls++ })
 
 		handler := srv.Handler(sip.NOTIFY)
 		require.NotNil(t, handler)

@@ -1,6 +1,7 @@
 package sip
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"time"
@@ -63,7 +64,7 @@ func (tx *ServerTx) Init() error {
 				nil,
 			)
 			// tx.Log().Trace("timer_1xx fired")
-			if err := tx.Respond(trying); err != nil {
+			if err := tx.respond(trying); err != nil {
 				tx.log.Error("send '100 Trying' response failed", "error", err, "tx", tx.Key())
 			}
 		})
@@ -104,7 +105,20 @@ func (tx *ServerTx) Receive(req *Request) error {
 	return nil
 }
 
-func (tx *ServerTx) Respond(res *Response) error {
+// Respond passes res to the transaction's state machine and returns the error
+// the transaction ended with, if any. Once ctx has ended it hands nothing to
+// the state machine and returns the cause of the end.
+func (tx *ServerTx) Respond(ctx context.Context, res *Response) error {
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
+	}
+	return tx.respond(res)
+}
+
+// respond is Respond without a ctx, for the transaction layer's own outputs
+// that have no handler to take one from: the 100 Trying timer and the answer
+// to a request no run serves.
+func (tx *ServerTx) respond(res *Response) error {
 	if res.IsCancel() {
 		return tx.conn.WriteMsg(res)
 	}

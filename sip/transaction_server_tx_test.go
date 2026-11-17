@@ -60,9 +60,9 @@ func TestServerTransactionFSM(t *testing.T) {
 		res100 := NewResponseFromRequest(req, StatusTrying, "Trying", nil)
 		res200 := NewResponseFromRequest(req, StatusOK, "OK", nil)
 
-		require.NoError(t, tx.Respond(res200))
-		require.NoError(t, tx.Respond(res100))
-		require.NoError(t, tx.Respond(res100))
+		require.NoError(t, tx.Respond(testCtx(t), res200))
+		require.NoError(t, tx.Respond(testCtx(t), res100))
+		require.NoError(t, tx.Respond(testCtx(t), res100))
 
 		require.NoError(t, compareFunctions(tx.currentFsmState(), tx.inviteStateAccepted))
 	})
@@ -93,7 +93,7 @@ func TestServerTransactionNonInviteFSM(t *testing.T) {
 		require.NoError(t, compareFunctions(tx.currentFsmState(), tx.stateTrying))
 
 		// passing 200 response
-		err = tx.Respond(NewResponseFromRequest(req, 200, "OK", nil))
+		err = tx.Respond(testCtx(t), NewResponseFromRequest(req, 200, "OK", nil))
 		require.NoError(t, err)
 		require.NoError(t, compareFunctions(tx.currentFsmState(), tx.stateCompleted))
 
@@ -116,7 +116,7 @@ func TestServerTransactionNonInviteFSM(t *testing.T) {
 		require.NoError(t, compareFunctions(tx.currentFsmState(), tx.stateTrying))
 
 		// passing 200 response
-		err = tx.Respond(NewResponseFromRequest(req, 200, "OK", nil))
+		err = tx.Respond(testCtx(t), NewResponseFromRequest(req, 200, "OK", nil))
 		require.NoError(t, err)
 
 		// timer J should be zero, so Completed ends as soon as the timer
@@ -148,7 +148,7 @@ func TestServerTransactionRespondReliableFinal(t *testing.T) {
 		tx := NewServerTx("123", req, conn, slog.New(slog.NewTextHandler(io.Discard, nil)))
 		require.NoError(t, tx.Init())
 
-		require.NoError(t, tx.Respond(NewResponseFromRequest(req, 200, "OK", nil)), "exchange %d", i)
+		require.NoError(t, tx.Respond(testCtx(t), NewResponseFromRequest(req, 200, "OK", nil)), "exchange %d", i)
 		select {
 		case <-tx.Done():
 		case <-time.After(5 * time.Second):
@@ -180,7 +180,7 @@ func TestServerTransactionFSMInvite(t *testing.T) {
 
 		// We received Cancel while dealing with resposn
 		res100 := NewResponseFromRequest(req, StatusTrying, "Trying", nil)
-		require.NoError(t, tx.Respond(res100))
+		require.NoError(t, tx.Respond(testCtx(t), res100))
 
 		// Cancel will play
 		cancelReq := NewRequest(CANCEL, req.Recipient)
@@ -264,13 +264,13 @@ func TestServerTransactionAbsorbsNonSuccessAck(t *testing.T) {
 		{
 			name: "486 answer",
 			complete: func(t *testing.T, tx *ServerTx, req *Request) {
-				require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusBusyHere, "Busy Here", nil)))
+				require.NoError(t, tx.Respond(testCtx(t), NewResponseFromRequest(req, StatusBusyHere, "Busy Here", nil)))
 			},
 		},
 		{
 			name: "487 after CANCEL",
 			complete: func(t *testing.T, tx *ServerTx, req *Request) {
-				require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusTrying, "Trying", nil)))
+				require.NoError(t, tx.Respond(testCtx(t), NewResponseFromRequest(req, StatusTrying, "Trying", nil)))
 				cancelReq := NewRequest(CANCEL, req.Recipient)
 				cancelReq.AppendHeader(HeaderClone(req.Via()))
 				cancelReq.AppendHeader(HeaderClone(req.From()))
@@ -306,7 +306,7 @@ func TestServerTransactionAbsorbsNonSuccessAck(t *testing.T) {
 // the ACK arrived, which DialogServerSession.WriteResponse relies on.
 func TestServerTransactionOffersAbsorbedAckToWaitingReader(t *testing.T) {
 	tx, req, _ := newTestInviteServerTx(t, 10*time.Second)
-	require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusBusyHere, "Busy Here", nil)))
+	require.NoError(t, tx.Respond(testCtx(t), NewResponseFromRequest(req, StatusBusyHere, "Busy Here", nil)))
 
 	ack := newTestAck(req)
 	require.NoError(t, tx.Receive(ack))
@@ -323,7 +323,7 @@ func TestServerTransactionOffersAbsorbedAckToWaitingReader(t *testing.T) {
 // Accepted state is passed up to a reader of Acks() (RFC 6026 7.1).
 func TestServerTransactionPassesUpSuccessAck(t *testing.T) {
 	tx, req, _ := newTestInviteServerTx(t, 10*time.Second)
-	require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusOK, "OK", nil)))
+	require.NoError(t, tx.Respond(testCtx(t), NewResponseFromRequest(req, StatusOK, "OK", nil)))
 	require.NoError(t, compareFunctions(tx.currentFsmState(), tx.inviteStateAccepted))
 
 	ack := newTestAck(req)
@@ -342,7 +342,7 @@ func TestServerTransactionPassesUpSuccessAck(t *testing.T) {
 // missed at Warn when the transaction ends before anybody reads it.
 func TestServerTransactionWarnsWhenSuccessAckUnread(t *testing.T) {
 	tx, req, capture := newTestInviteServerTx(t, 10*time.Second)
-	require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusOK, "OK", nil)))
+	require.NoError(t, tx.Respond(testCtx(t), NewResponseFromRequest(req, StatusOK, "OK", nil)))
 	require.NoError(t, tx.Receive(newTestAck(req)))
 
 	tx.Terminate()
@@ -395,7 +395,7 @@ func TestServerTransactionReleasesConnRef(t *testing.T) {
 // 64*T1.
 func TestServerTransactionTerminateStopsTimerL(t *testing.T) {
 	tx, req, _ := newTestInviteServerTx(t, 10*time.Second)
-	require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusOK, "OK", nil)))
+	require.NoError(t, tx.Respond(testCtx(t), NewResponseFromRequest(req, StatusOK, "OK", nil)))
 	require.NoError(t, compareFunctions(tx.currentFsmState(), tx.inviteStateAccepted))
 
 	tx.Terminate()
@@ -459,8 +459,8 @@ func TestServerTransactionKeepsResponseItTook(t *testing.T) {
 	t.Run("InviteCompletedRefuses2xx", func(t *testing.T) {
 		req, _, _ := testCreateInvite(t, "sip:127.0.0.99:5060", "udp", "127.0.0.2:5060")
 		tx, rec := newTx(t, req)
-		require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusBusyHere, "Busy Here", nil)))
-		require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusOK, "OK", nil)))
+		require.NoError(t, tx.Respond(testCtx(t), NewResponseFromRequest(req, StatusBusyHere, "Busy Here", nil)))
+		require.NoError(t, tx.Respond(testCtx(t), NewResponseFromRequest(req, StatusOK, "OK", nil)))
 		require.NoError(t, compareFunctions(tx.currentFsmState(), tx.inviteStateCompleted))
 
 		// A retransmitted INVITE is answered with the response kept.
@@ -476,8 +476,8 @@ func TestServerTransactionKeepsResponseItTook(t *testing.T) {
 		req, _, _ := testCreateInvite(t, "sip:127.0.0.99:5060", "udp", "127.0.0.2:5060")
 		tx, _ := newTx(t, req)
 		res200 := NewResponseFromRequest(req, StatusOK, "OK", nil)
-		require.NoError(t, tx.Respond(res200))
-		require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusBusyHere, "Busy Here", nil)))
+		require.NoError(t, tx.Respond(testCtx(t), res200))
+		require.NoError(t, tx.Respond(testCtx(t), NewResponseFromRequest(req, StatusBusyHere, "Busy Here", nil)))
 		require.NoError(t, compareFunctions(tx.currentFsmState(), tx.inviteStateAccepted))
 
 		tx.fsmMu.Lock()
@@ -489,8 +489,8 @@ func TestServerTransactionKeepsResponseItTook(t *testing.T) {
 	t.Run("InviteAcceptedRefuses1xx", func(t *testing.T) {
 		req, _, _ := testCreateInvite(t, "sip:127.0.0.99:5060", "udp", "127.0.0.2:5060")
 		tx, _ := newTx(t, req)
-		require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusOK, "OK", nil)))
-		require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusRinging, "Ringing", nil)))
+		require.NoError(t, tx.Respond(testCtx(t), NewResponseFromRequest(req, StatusOK, "OK", nil)))
+		require.NoError(t, tx.Respond(testCtx(t), NewResponseFromRequest(req, StatusRinging, "Ringing", nil)))
 
 		// A finalized transaction over UDP is retained for its timers.
 		tx.TerminateGracefully()
@@ -504,8 +504,8 @@ func TestServerTransactionKeepsResponseItTook(t *testing.T) {
 	t.Run("NonInviteCompletedRefusesFinal", func(t *testing.T) {
 		req := testCreateRequest(t, "BYE", "sip:127.0.0.99:5060", "UDP", "127.0.0.2:5060")
 		tx, rec := newTx(t, req)
-		require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusOK, "OK", nil)))
-		require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusInternalServerError, "Internal Server Error", nil)))
+		require.NoError(t, tx.Respond(testCtx(t), NewResponseFromRequest(req, StatusOK, "OK", nil)))
+		require.NoError(t, tx.Respond(testCtx(t), NewResponseFromRequest(req, StatusInternalServerError, "Internal Server Error", nil)))
 		require.NoError(t, compareFunctions(tx.currentFsmState(), tx.stateCompleted))
 
 		// A retransmitted BYE is answered with the response kept.

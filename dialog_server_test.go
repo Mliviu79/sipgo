@@ -162,7 +162,7 @@ func TestDialogServerRequestsWithinDialog(t *testing.T) {
 		byeWrongCseq.CSeq().SeqNo--
 		tx = sip.NewServerTx("test", byeWrongCseq, byeConn, slog.Default())
 		tx.Init()
-		err = dialog.ReadBye(byeWrongCseq, tx)
+		err = dialog.ReadBye(testCtx(t), byeWrongCseq, tx)
 		require.ErrorIs(t, err, ErrDialogInvalidCseq)
 	})
 
@@ -201,7 +201,7 @@ func TestDialogServerRequestsWithinDialog(t *testing.T) {
 		bye := newByeRequestUAC(invite, sip.NewResponseFromRequest(invite, 200, "OK", nil), nil)
 		tx = sip.NewServerTx("test-bye", bye, byeConn, slog.Default())
 		tx.Init()
-		err = dialog.ReadBye(bye, tx)
+		err = dialog.ReadBye(testCtx(t), bye, tx)
 		require.NoError(t, err)
 	})
 }
@@ -238,7 +238,7 @@ func TestDialogServer2xxRetransmission(t *testing.T) {
 	// This will block until ACK
 	res200 := sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil)
 	answered := make(chan error, 1)
-	go func() { answered <- d.WriteResponse(res200) }()
+	go func() { answered <- d.WriteResponse(testCtx(t), res200) }()
 
 	deadline := time.After(10 * time.Second)
 	for len(conn.sendTimes()) < 2 {
@@ -301,7 +301,7 @@ func TestDialogServerAckAfterBye(t *testing.T) {
 	states := d.StateRead()
 	res200 := sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil)
 	answered := make(chan error, 1)
-	go func() { answered <- d.WriteResponse(res200) }()
+	go func() { answered <- d.WriteResponse(testCtx(t), res200) }()
 
 	readState := func() sip.DialogState {
 		t.Helper()
@@ -318,7 +318,7 @@ func TestDialogServerAckAfterBye(t *testing.T) {
 	bye := newByeRequestUAC(invite, res200, nil)
 	byeTx := sip.NewServerTx("test-bye", bye, newConn(), slog.Default())
 	require.NoError(t, byeTx.Init())
-	require.NoError(t, d.ReadBye(bye, byeTx))
+	require.NoError(t, d.ReadBye(testCtx(t), bye, byeTx))
 	require.Equal(t, sip.DialogStateEnded, readState())
 
 	select {
@@ -372,7 +372,7 @@ func TestDialogServerAnswerAfterCancel(t *testing.T) {
 	require.Equal(t, sip.DialogStateEnded, d.LoadState())
 
 	states := d.StateRead()
-	err = d.WriteResponse(sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil))
+	err = d.WriteResponse(testCtx(t), sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil))
 	require.ErrorIs(t, err, sip.ErrTransactionCanceled)
 	assert.Equal(t, sip.DialogStateEnded, d.LoadState())
 	select {
@@ -450,7 +450,7 @@ func TestDialogServer2xxAckTimeout(t *testing.T) {
 			res200 := sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil)
 			start := time.Now()
 			answered := make(chan error, 1)
-			go func() { answered <- d.WriteResponse(res200) }()
+			go func() { answered <- d.WriteResponse(testCtx(t), res200) }()
 
 			select {
 			case err := <-answered:
@@ -536,7 +536,7 @@ func TestDialogServer2xxRetransmissionInterval(t *testing.T) {
 
 	res200 := sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil)
 	answered := make(chan error, 1)
-	go func() { answered <- d.WriteResponse(res200) }()
+	go func() { answered <- d.WriteResponse(testCtx(t), res200) }()
 
 	// The 2xx and its first three retransmissions, all well within the 64*T1
 	// that WriteResponse waits for the ACK.
@@ -608,7 +608,7 @@ func TestDialogServerEndedWhileAnswering(t *testing.T) {
 
 	res200 := sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil)
 	answered := make(chan error, 1)
-	go func() { answered <- d.WriteResponse(res200) }()
+	go func() { answered <- d.WriteResponse(testCtx(t), res200) }()
 	select {
 	case err := <-answered:
 		require.ErrorIs(t, err, ErrDialogEndedBeforeAck)
@@ -647,7 +647,7 @@ func TestDialogServerAnswerAgainAfterAck(t *testing.T) {
 
 	res200 := sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil)
 	answered := make(chan error, 1)
-	go func() { answered <- d.WriteResponse(res200) }()
+	go func() { answered <- d.WriteResponse(testCtx(t), res200) }()
 	select {
 	case <-conn.wrote:
 	case err := <-answered:
@@ -664,7 +664,7 @@ func TestDialogServerAnswerAgainAfterAck(t *testing.T) {
 	}
 
 	states := d.StateRead()
-	go func() { answered <- d.WriteResponse(res200) }()
+	go func() { answered <- d.WriteResponse(testCtx(t), res200) }()
 	select {
 	case err := <-answered:
 		require.NoError(t, err)
@@ -717,7 +717,7 @@ func TestDialogServerCanceledWhileAnswering(t *testing.T) {
 
 	res200 := sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil)
 	answered := make(chan error, 1)
-	go func() { answered <- d.WriteResponse(res200) }()
+	go func() { answered <- d.WriteResponse(testCtx(t), res200) }()
 	select {
 	case err := <-answered:
 		require.ErrorIs(t, err, sip.ErrTransactionCanceled)
@@ -787,7 +787,7 @@ func TestDialogServerByeOutOfOrder(t *testing.T) {
 	bye := newInDialogRequest(invite, res200, sip.BYE, seqNo+1)
 	byeTx := siptest.NewServerTxRecorder(bye)
 	defer byeTx.Terminate()
-	require.ErrorIs(t, d.ReadBye(bye, byeTx), ErrDialogInvalidCseq)
+	require.ErrorIs(t, d.ReadBye(testCtx(t), bye, byeTx), ErrDialogInvalidCseq)
 	answers := byeTx.Result()
 	require.Len(t, answers, 1, "the out-of-order BYE is answered once")
 	assert.Equal(t, sip.StatusInternalServerError, answers[0].StatusCode)
@@ -796,7 +796,7 @@ func TestDialogServerByeOutOfOrder(t *testing.T) {
 	bye = newInDialogRequest(invite, res200, sip.BYE, seqNo+3)
 	byeTx = siptest.NewServerTxRecorder(bye)
 	defer byeTx.Terminate()
-	require.NoError(t, d.ReadBye(bye, byeTx))
+	require.NoError(t, d.ReadBye(testCtx(t), bye, byeTx))
 	answers = byeTx.Result()
 	require.Len(t, answers, 1)
 	assert.Equal(t, sip.StatusOK, answers[0].StatusCode)
@@ -831,7 +831,7 @@ func TestDialogServerByeAnswerFails(t *testing.T) {
 	bye := newInDialogRequest(invite, res200, sip.BYE, invite.CSeq().SeqNo+1)
 	byeTx := siptest.NewServerTxRecorder(bye)
 	byeTx.Terminate()
-	require.ErrorIs(t, d.ReadBye(bye, byeTx), sip.ErrTransactionTerminated)
+	require.ErrorIs(t, d.ReadBye(testCtx(t), bye, byeTx), sip.ErrTransactionTerminated)
 
 	assert.Equal(t, sip.DialogStateEnded, d.LoadState())
 	select {
@@ -980,7 +980,7 @@ func TestDialogServerRespondAfterAnswer(t *testing.T) {
 
 		res200 := sip.NewSDPResponseFromRequest(d.InviteRequest, []byte("v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n"))
 		answered := make(chan error, 1)
-		go func() { answered <- d.WriteResponse(res200) }()
+		go func() { answered <- d.WriteResponse(testCtx(t), res200) }()
 		select {
 		case <-conn.wrote:
 		case err := <-answered:
@@ -1002,7 +1002,7 @@ func TestDialogServerRespondAfterAnswer(t *testing.T) {
 	writeResponse := func(t *testing.T, d *DialogServerSession, res *sip.Response) error {
 		t.Helper()
 		written := make(chan error, 1)
-		go func() { written <- d.WriteResponse(res) }()
+		go func() { written <- d.WriteResponse(testCtx(t), res) }()
 		select {
 		case err := <-written:
 			return err

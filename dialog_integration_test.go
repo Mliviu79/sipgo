@@ -63,7 +63,7 @@ func TestIntegrationDialog(t *testing.T) {
 		}
 		// defer dlg.Close()
 
-		if err := dlg.authDigest(&digestChal, auth); err != nil {
+		if err := dlg.authDigest(testCtx(t), &digestChal, auth); err != nil {
 			// The UAC sends the INVITE again with its credentials.
 			if !errors.Is(err, errDialogUnauthorized) {
 				errs.report("UAS: challenge INVITE: %w", err)
@@ -73,13 +73,13 @@ func TestIntegrationDialog(t *testing.T) {
 		defer func() { callDone <- struct{}{} }()
 
 		for _, code := range []int{sip.StatusTrying, sip.StatusRinging} {
-			if err := dlg.Respond(code, "", nil); err != nil {
+			if err := dlg.Respond(testCtx(t), code, "", nil); err != nil {
 				errs.report("UAS: respond %d: %w", code, err)
 				return
 			}
 		}
 
-		err = dlg.Respond(sip.StatusOK, "OK", nil)
+		err = dlg.Respond(testCtx(t), sip.StatusOK, "OK", nil)
 		if errors.Is(err, ErrDialogEndedBeforeAck) {
 			// Requests are handled on goroutines of their own, so the BYE that
 			// the UAC sends right behind its ACK can be read first and end the
@@ -109,22 +109,22 @@ func TestIntegrationDialog(t *testing.T) {
 
 	srv.OnAck(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		if req.Recipient.Addr() != uasContact.Address.Addr() {
-			tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Not valid SIP uri", nil))
+			tx.Respond(testCtx(t), sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Not valid SIP uri", nil))
 			return
 		}
 		if err := dialogSrv.ReadAck(req, tx); err != nil {
-			tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, err.Error(), nil))
+			tx.Respond(testCtx(t), sip.NewResponseFromRequest(req, sip.StatusBadRequest, err.Error(), nil))
 		}
 	})
 
 	srv.OnBye(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		if req.Recipient.Addr() != uasContact.Address.Addr() {
-			tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Not valid SIP uri", nil))
+			tx.Respond(testCtx(t), sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Not valid SIP uri", nil))
 			return
 		}
 
-		if err := dialogSrv.ReadBye(req, tx); err != nil {
-			tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, err.Error(), nil))
+		if err := dialogSrv.ReadBye(testCtx(t), req, tx); err != nil {
+			tx.Respond(testCtx(t), sip.NewResponseFromRequest(req, sip.StatusBadRequest, err.Error(), nil))
 		}
 	})
 
@@ -148,7 +148,7 @@ func TestIntegrationDialog(t *testing.T) {
 
 		// Setup server side
 		srv.OnBye(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
-			if err := dialogCli.ReadBye(req, tx); err != nil {
+			if err := dialogCli.ReadBye(testCtx(t), req, tx); err != nil {
 				errs.report("UAC: read BYE: %w", err)
 			}
 		})
@@ -263,17 +263,17 @@ func TestIntegrationDialogBrokenUAC(t *testing.T) {
 		}
 		// defer dlg.Close()
 
-		err = dlg.Respond(sip.StatusTrying, "Trying", nil)
+		err = dlg.Respond(testCtx(t), sip.StatusTrying, "Trying", nil)
 		if err != nil {
 			fmt.Println("Error OnInvite", err)
 			return
 		}
-		err = dlg.Respond(sip.StatusRinging, "Ringing", nil)
+		err = dlg.Respond(testCtx(t), sip.StatusRinging, "Ringing", nil)
 		if err != nil {
 			fmt.Println("Error OnInvite", err)
 			return
 		}
-		err = dlg.Respond(sip.StatusOK, "OK", nil)
+		err = dlg.Respond(testCtx(t), sip.StatusOK, "OK", nil)
 		if err != nil {
 			fmt.Println("Error OnInvite", err)
 			return
@@ -309,7 +309,7 @@ func TestIntegrationDialogBrokenUAC(t *testing.T) {
 
 		// Setup server side
 		srv.OnBye(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
-			if err := dialogCli.ReadBye(req, tx); err != nil {
+			if err := dialogCli.ReadBye(testCtx(t), req, tx); err != nil {
 				errs.report("UAC: read BYE: %w", err)
 			}
 		})
@@ -321,7 +321,7 @@ func TestIntegrationDialogBrokenUAC(t *testing.T) {
 
 		t.Run("UAS BYE Error", func(t *testing.T) {
 			srv.OnBye(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
-				tx.Respond(sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "", nil))
+				tx.Respond(testCtx(t), sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "", nil))
 			})
 			// INVITE
 			t.Log("UAC: INVITE ", uasContact.Address.String())
@@ -404,7 +404,7 @@ func TestIntegrationDialogCancel(t *testing.T) {
 		}
 
 		for _, code := range []int{sip.StatusTrying, sip.StatusRinging} {
-			if err := dlg.Respond(code, "", nil); err != nil {
+			if err := dlg.Respond(testCtx(t), code, "", nil); err != nil {
 				errs.report("UAS: respond %d: %w", code, err)
 				return
 			}

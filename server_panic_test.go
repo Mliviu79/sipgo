@@ -91,17 +91,17 @@ func TestServerRecoversPanickingHandler(t *testing.T) {
 
 	srv, err := NewServer(ua)
 	require.NoError(t, err)
-	srv.OnInfo(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
+	srv.OnInfo(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		panic(handlerPanicSentinel)
 	})
-	srv.OnMessage(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
-		if err := tx.Respond(sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)); err != nil {
+	srv.OnMessage(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
+		if err := tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)); err != nil {
 			t.Errorf("respond 200 to MESSAGE: %v", err)
 		}
 		panic(handlerPanicSentinel)
 	})
-	srv.OnOptions(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
-		if err := tx.Respond(sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)); err != nil {
+	srv.OnOptions(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
+		if err := tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)); err != nil {
 			t.Errorf("respond 200 to OPTIONS: %v", err)
 		}
 	})

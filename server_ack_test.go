@@ -31,8 +31,8 @@ func TestServerAbsorbsAckForNonSuccessAnswer(t *testing.T) {
 	srv, err := NewServer(ua)
 	require.NoError(t, err)
 	handled := make(chan *sip.ServerTx, 1)
-	srv.OnInvite(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
-		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBusyHere, "Busy Here", nil))
+	srv.OnInvite(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
+		_ = tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusBusyHere, "Busy Here", nil))
 		handled <- tx.(*sip.ServerTx)
 	})
 	serveRequests(t, srv)

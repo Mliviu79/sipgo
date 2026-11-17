@@ -119,9 +119,9 @@ func TestIntegrationClientServer(t *testing.T) {
 		srv, err := NewServer(ua)
 		require.NoError(t, err)
 
-		srv.OnInvite(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
+		srv.OnInvite(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 			res := sip.NewResponseFromRequest(req, 200, "OK", nil)
-			if err := tx.Respond(res); err != nil {
+			if err := tx.Respond(ctx, res); err != nil {
 				errs.report("respond 200: %w", err)
 				return
 			}
@@ -201,11 +201,11 @@ func TestIntegrationServerResponse(t *testing.T) {
 	srv, _ := NewServer(ua)
 
 	serverResDestination := atomic.Pointer[string]{}
-	srv.OnOptions(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
+	srv.OnOptions(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		res := sip.NewResponseFromRequest(req, 200, "", nil)
 		dst := res.Destination()
 		serverResDestination.Store(&dst)
-		tx.Respond(res)
+		tx.Respond(ctx, res)
 	})
 	serveRequests(t, srv)
 
@@ -290,9 +290,9 @@ func BenchmarkIntegrationClientServer(t *testing.B) {
 		srv, err := NewServer(ua)
 		require.NoError(t, err)
 
-		srv.OnInvite(func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
+		srv.OnInvite(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 			res := sip.NewResponseFromRequest(req, 200, "OK", nil)
-			if err := tx.Respond(res); err != nil {
+			if err := tx.Respond(ctx, res); err != nil {
 				errs.report("respond 200: %w", err)
 				return
 			}

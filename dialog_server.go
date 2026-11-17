@@ -36,8 +36,8 @@ func (s *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction
 // returned and the dialog goes on (RFC 3261 section 12.2.2). The remote
 // sequence number is left as it is, so the ACK to our 2xx, read after the BYE
 // when it is overtaken, still matches it.
-func (s *DialogServerSession) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
-	if err := s.refuseOutOfOrder(req, tx); err != nil {
+func (s *DialogServerSession) ReadBye(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
+	if err := s.refuseOutOfOrder(ctx, req, tx); err != nil {
 		return err
 	}
 
@@ -45,7 +45,7 @@ func (s *DialogServerSession) ReadBye(req *sip.Request, tx sip.ServerTransaction
 	defer s.inviteTx.Terminate() // Terminat`es Invite transaction
 
 	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
-	err := tx.Respond(res)
+	err := tx.Respond(ctx, res)
 	// The dialog ends whether or not the 200 is sent: it is closed and its
 	// INVITE transaction terminated either way.
 	s.setState(sip.DialogStateEnded)
@@ -186,7 +186,7 @@ func (s *DialogServerSession) Close() error {
 // 2xx for creating dialog or other code in case failure
 //
 // In case Cancel request received: ErrDialogCanceled is responded
-func (s *DialogServerSession) Respond(statusCode int, reason string, body []byte, headers ...sip.Header) error {
+func (s *DialogServerSession) Respond(ctx context.Context, statusCode int, reason string, body []byte, headers ...sip.Header) error {
 	// Must copy Record-Route headers. Done by this command
 	res := sip.NewResponseFromRequest(s.InviteRequest, statusCode, reason, body)
 
@@ -194,22 +194,22 @@ func (s *DialogServerSession) Respond(statusCode int, reason string, body []byte
 		res.AppendHeader(h)
 	}
 
-	return s.WriteResponse(res)
+	return s.WriteResponse(ctx, res)
 }
 
 // RespondSDP is just wrapper to call 200 with SDP.
 // It is better to use this when answering as it provide correct headers
-func (s *DialogServerSession) RespondSDP(sdp []byte) error {
+func (s *DialogServerSession) RespondSDP(ctx context.Context, sdp []byte) error {
 	if sdp == nil {
 		return fmt.Errorf("sdp not provided")
 	}
 	res := sip.NewSDPResponseFromRequest(s.InviteRequest, sdp)
-	return s.WriteResponse(res)
+	return s.WriteResponse(ctx, res)
 }
 
 var errDialogUnauthorized = errors.New("unathorized")
 
-func (s *DialogServerSession) authDigest(chal *digest.Challenge, opts digest.Options) error {
+func (s *DialogServerSession) authDigest(ctx context.Context, chal *digest.Challenge, opts digest.Options) error {
 	authorized := func() bool {
 		authorizationHDR := s.InviteRequest.GetHeader("Authorization")
 		if authorizationHDR == nil {
@@ -239,7 +239,7 @@ func (s *DialogServerSession) authDigest(chal *digest.Challenge, opts digest.Opt
 
 	res := sip.NewResponseFromRequest(s.InviteRequest, sip.StatusUnauthorized, "Unauthorized", nil)
 	res.AppendHeader(hdr)
-	if err := s.WriteResponse(res); err != nil {
+	if err := s.WriteResponse(ctx, res); err != nil {
 		return err
 	}
 
@@ -258,7 +258,7 @@ func (s *DialogServerSession) authDigest(chal *digest.Challenge, opts digest.Opt
 // established ends. Once the dialog is answered with a 2xx, that 2xx may be
 // written again, which sends it again, and any other response is refused with
 // ErrDialogAlreadyAnswered.
-func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
+func (s *DialogServerSession) WriteResponse(ctx context.Context, res *sip.Response) error {
 	tx := s.inviteTx
 
 	if res.Contact() == nil {
@@ -286,11 +286,11 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 	if !res.IsSuccess() {
 		if res.IsProvisional() {
 			// This will not create dialog so we will just respond
-			return tx.Respond(res)
+			return tx.Respond(ctx, res)
 		}
 
 		// For final response we want to set dialog ended state
-		if err := tx.Respond(res); err != nil {
+		if err := tx.Respond(ctx, res); err != nil {
 			return err
 		}
 
@@ -299,6 +299,11 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 		case <-tx.Acks():
 		case <-tx.Done():
 			// This means tx moved to terminated state and no more invite retransmissions is accepted
+		case <-ctx.Done():
+			// The answer is sent: the dialog ends, and the caller learns that
+			// the wait for the ACK was cut short.
+			s.setState(sip.DialogStateEnded)
+			return context.Cause(ctx)
 		}
 		s.setState(sip.DialogStateEnded)
 		return nil
@@ -344,7 +349,7 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 	ackTimeout := time.NewTimer(64 * sip.T1)
 	defer ackTimeout.Stop()
 
-	if err := tx.Respond(res); err != nil {
+	if err := tx.Respond(ctx, res); err != nil {
 		// The transaction took no 2xx, for example after a CANCEL read once
 		// the dialog was established, which it answered 487. A dialog this
 		// call established is then never answered, and ends with the cause.
@@ -362,7 +367,7 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 	for state == sip.DialogStateEstablished {
 		select {
 		case <-timer.C:
-			if err := tx.Respond(res); err != nil {
+			if err := tx.Respond(ctx, res); err != nil {
 				// Timer L ends the transaction 64*T1 after the first
 				// transmission, just after the deadline. A retransmission
 				// that finds the transaction ended by it is past the
@@ -383,6 +388,8 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 
 		case <-ackTimeout.C:
 			return s.ackTimedOut()
+		case <-ctx.Done():
+			return context.Cause(ctx)
 		case state = <-readStateCh:
 		}
 	}
@@ -549,10 +556,10 @@ func (s *DialogServerCache) ReadAck(req *sip.Request, tx sip.ServerTransaction) 
 }
 
 // ReadBye should read from your OnBye handler. Returns error if it fails
-func (s *DialogServerCache) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
+func (s *DialogServerCache) ReadBye(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
 	dt, err := s.MatchDialogRequest(req)
 	if err != nil {
 		return err
 	}
-	return dt.ReadBye(req, tx)
+	return dt.ReadBye(ctx, req, tx)
 }

@@ -139,10 +139,10 @@ func setupSipProxy(proxydst string, ip string) *sipgo.Server {
 		return dst
 	}
 
-	var reply = func(tx sip.ServerTransaction, req *sip.Request, code int, reason string) {
+	var reply = func(ctx context.Context, tx sip.ServerTransaction, req *sip.Request, code int, reason string) {
 		resp := sip.NewResponseFromRequest(req, code, reason, nil)
 		resp.SetDestination(req.Source()) //This is optional, but can make sure not wrong via is read
-		if err := tx.Respond(resp); err != nil {
+		if err := tx.Respond(ctx, resp); err != nil {
 			log.Error("Fail to respond on transaction", "error", err)
 		}
 	}
@@ -153,7 +153,7 @@ func setupSipProxy(proxydst string, ip string) *sipgo.Server {
 		dst := getDestination(req)
 
 		if dst == "" {
-			reply(tx, req, 404, "Not found")
+			reply(ctx, tx, req, 404, "Not found")
 			return
 		}
 
@@ -162,7 +162,7 @@ func setupSipProxy(proxydst string, ip string) *sipgo.Server {
 		clTx, err := client.TransactionRequest(ctx, req, sipgo.ClientRequestAddVia, sipgo.ClientRequestAddRecordRoute)
 		if err != nil {
 			log.Error("RequestWithContext  failed", "error", err)
-			reply(tx, req, 500, "")
+			reply(ctx, tx, req, 500, "")
 			return
 		}
 		defer clTx.Terminate()
@@ -184,7 +184,7 @@ func setupSipProxy(proxydst string, ip string) *sipgo.Server {
 
 				// Removes top most header
 				res.RemoveHeader("Via")
-				if err := tx.Respond(res); err != nil {
+				if err := tx.Respond(ctx, res); err != nil {
 					log.Error("ResponseHandler transaction respond failed", "error", err)
 				}
 
@@ -241,18 +241,18 @@ func setupSipProxy(proxydst string, ip string) *sipgo.Server {
 		}
 	}
 
-	var registerHandler = func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
+	var registerHandler = func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		// https://www.rfc-editor.org/rfc/rfc3261#section-10.3
 		cont := req.Contact()
 		if cont == nil {
-			reply(tx, req, 404, "Missing address of record")
+			reply(ctx, tx, req, 404, "Missing address of record")
 			return
 		}
 
 		// We have a list of uris
 		uri := cont.Address
 		if uri.Host == host && uri.Port == port {
-			reply(tx, req, 401, "Contact address not provided")
+			reply(ctx, tx, req, 401, "Contact address not provided")
 			return
 		}
 
@@ -268,7 +268,7 @@ func setupSipProxy(proxydst string, ip string) *sipgo.Server {
 		cont.Address.UriParams = sip.NewParams()
 		cont.Address.UriParams.Add("transport", req.Transport())
 
-		if err := tx.Respond(res); err != nil {
+		if err := tx.Respond(ctx, res); err != nil {
 			log.Error("Sending REGISTER OK failed", "error", err)
 			return
 		}
@@ -278,7 +278,7 @@ func setupSipProxy(proxydst string, ip string) *sipgo.Server {
 		route(ctx, req, tx)
 	}
 
-	var ackHandler = func(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
+	var ackHandler = func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		dst := getDestination(req)
 		if dst == "" {
 			return
@@ -286,7 +286,7 @@ func setupSipProxy(proxydst string, ip string) *sipgo.Server {
 		req.SetDestination(dst)
 		if err := client.WriteRequest(req, sipgo.ClientRequestAddVia); err != nil {
 			log.Error("Send failed", "error", err)
-			reply(tx, req, 500, "")
+			reply(ctx, tx, req, 500, "")
 		}
 	}
 

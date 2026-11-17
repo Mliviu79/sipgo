@@ -110,8 +110,8 @@ func serve(txl *TransactionLayer, ctx context.Context) (ready <-chan struct{}, r
 	return r, e
 }
 
-func respondOK(req *Request, tx *ServerTx) {
-	_ = tx.Respond(NewResponseFromRequest(req, StatusOK, "OK", nil))
+func respondOK(ctx context.Context, req *Request, tx *ServerTx) {
+	_ = tx.Respond(ctx, NewResponseFromRequest(req, StatusOK, "OK", nil))
 }
 
 func TestServeRequestsHandlerReceivesRunContext(t *testing.T) {
@@ -119,7 +119,7 @@ func TestServeRequestsHandlerReceivesRunContext(t *testing.T) {
 	seen := make(chan any, 1)
 	l.txl.OnRequest(func(ctx context.Context, req *Request, tx *ServerTx) {
 		seen <- ctx.Value(serveCtxKey{})
-		respondOK(req, tx)
+		respondOK(ctx, req, tx)
 	})
 
 	ctx, cancel := context.WithCancelCause(context.WithValue(testCtx(t), serveCtxKey{}, "run"))
@@ -198,7 +198,7 @@ func TestServeRequestsAfterContextEndAnswers480(t *testing.T) {
 	var ran atomic.Bool
 	l.txl.OnRequest(func(ctx context.Context, req *Request, tx *ServerTx) {
 		ran.Store(true)
-		respondOK(req, tx)
+		respondOK(ctx, req, tx)
 	})
 
 	ctx, cancel := context.WithCancelCause(testCtx(t))
@@ -224,7 +224,7 @@ func TestUnservedRequestIsAnswered480AndAckDropped(t *testing.T) {
 	var ran atomic.Bool
 	l.txl.OnRequest(func(ctx context.Context, req *Request, tx *ServerTx) {
 		ran.Store(true)
-		respondOK(req, tx)
+		respondOK(ctx, req, tx)
 	})
 
 	l.send(t, "OPTIONS")
@@ -288,7 +288,7 @@ func TestServeRequestsManyRequestsWhileRunEnds(t *testing.T) {
 	handler := func(ctx context.Context, req *Request, tx *ServerTx) {
 		entered.Add(1)
 		defer exited.Add(1)
-		respondOK(req, tx)
+		respondOK(ctx, req, tx)
 	}
 	l.txl.OnRequest(handler)
 

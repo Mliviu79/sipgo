@@ -1,6 +1,7 @@
 package siptest
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -29,12 +30,15 @@ func TestServerTxRecorderResultWhileResponding(t *testing.T) {
 	invite.AppendHeader(&callID)
 	invite.AppendHeader(&sip.CSeqHeader{SeqNo: 1, MethodName: sip.INVITE})
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	rec := NewServerTxRecorder(invite)
 	defer rec.Terminate()
 
 	responded := make(chan error, 1)
 	go func() {
-		responded <- rec.Respond(sip.NewResponseFromRequest(invite, sip.StatusRinging, "Ringing", nil))
+		responded <- rec.Respond(ctx, sip.NewResponseFromRequest(invite, sip.StatusRinging, "Ringing", nil))
 	}()
 	// Read while the response may still be written.
 	_ = rec.Result()

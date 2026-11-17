@@ -456,10 +456,10 @@ func (srv *Server) getHandler(method sip.RequestMethod) (handler RequestHandler)
 	return handler
 }
 
-func (srv *Server) defaultUnhandledHandler(_ context.Context, req *sip.Request, tx sip.ServerTransaction) {
+func (srv *Server) defaultUnhandledHandler(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 	srv.log.Warn("SIP request handler not found", "method", req.Method)
 	res := sip.NewResponseFromRequest(req, 405, "Method Not Allowed", nil)
-	if err := tx.Respond(res); err != nil {
+	if err := tx.Respond(ctx, res); err != nil {
 		srv.log.Error("respond '405 Method Not Allowed' failed", "error", err)
 	}
 }

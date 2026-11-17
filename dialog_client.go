@@ -25,14 +25,14 @@ type DialogClientSession struct {
 // sequence number, which a request of the peer read before it, such as a
 // re-INVITE, set, is out of order: it is answered 500, ErrDialogInvalidCseq is
 // returned and the dialog goes on (RFC 3261 section 12.2.2).
-func (s *DialogClientSession) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
-	if err := s.refuseOutOfOrder(req, tx); err != nil {
+func (s *DialogClientSession) ReadBye(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
+	if err := s.refuseOutOfOrder(ctx, req, tx); err != nil {
 		return err
 	}
 	s.setState(sip.DialogStateEnded)
 
 	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
-	if err := tx.Respond(res); err != nil {
+	if err := tx.Respond(ctx, res); err != nil {
 		return err
 	}
 	defer s.Close()              // Delete our dialog always
@@ -837,10 +837,10 @@ func (c *DialogClientCache) WriteInvite(ctx context.Context, inviteRequest *sip.
 	return dt, err
 }
 
-func (c *DialogClientCache) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
+func (c *DialogClientCache) ReadBye(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) error {
 	dt, err := c.MatchRequestDialog(req)
 	if err != nil {
 		return err
 	}
-	return dt.ReadBye(req, tx)
+	return dt.ReadBye(ctx, req, tx)
 }

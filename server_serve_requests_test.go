@@ -79,7 +79,7 @@ func TestServerHandlerReceivesServeRequestsContext(t *testing.T) {
 	seen := make(chan any, 1)
 	s.srv.OnOptions(func(ctx context.Context, req *sip.Request, tx sip.ServerTransaction) {
 		seen <- ctx.Value(serverRunKey{})
-		if err := tx.Respond(sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)); err != nil {
+		if err := tx.Respond(ctx, sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)); err != nil {
 			t.Errorf("respond: %v", err)
 		}
 	})
