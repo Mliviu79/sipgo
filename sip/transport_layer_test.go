@@ -24,6 +24,63 @@ func testRawOptions(callID string) []byte {
 		"\r\n")
 }
 
+func TestClientFixedLocalAddressDoesNotMisroute(t *testing.T) {
+	for _, direct := range []bool{false, true} {
+		name := "transport layer"
+		if direct {
+			name = "direct transport"
+		}
+		t.Run(name, func(t *testing.T) {
+			first, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			defer first.Close()
+			second, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			defer second.Close()
+
+			layer := NewTransportLayer(net.DefaultResolver, NewParser(), nil)
+			defer layer.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			req := testCreateRequest(t, "OPTIONS", "sip:"+first.Addr().String(), "TCP", "127.0.0.1")
+			conn, err := layer.ClientRequestConnection(ctx, req)
+			require.NoError(t, err)
+			defer conn.TryClose()
+			require.NoError(t, first.(*net.TCPListener).SetDeadline(time.Now().Add(time.Second)))
+			peer, err := first.Accept()
+			require.NoError(t, err)
+			defer peer.Close()
+
+			require.Nil(t, layer.tcp.pool.getUnref(conn.LocalAddr().String()), "stream connections must not have local-address aliases")
+			local, remote := Addr{}, Addr{}
+			require.NoError(t, local.parseAddr(conn.LocalAddr().String()))
+			require.NoError(t, remote.parseAddr(second.Addr().String()))
+			req = testCreateRequest(t, "OPTIONS", "sip:"+second.Addr().String(), "TCP", "127.0.0.1")
+			req.Laddr = local
+			if direct {
+				conn, err = layer.tcp.CreateConnection(ctx, local, remote, func(Message) {})
+			} else {
+				conn, err = layer.ClientRequestConnection(ctx, req)
+			}
+			if err == nil {
+				defer conn.TryClose()
+				require.NoError(t, conn.WriteMsg(req))
+			}
+
+			require.NoError(t, peer.SetReadDeadline(time.Now().Add(50*time.Millisecond)))
+			buf := make([]byte, 2048)
+			n, readErr := peer.Read(buf)
+			require.Zero(t, n, "request for peer B reached peer A: %s", buf[:n])
+			var timeout net.Error
+			require.ErrorAs(t, readErr, &timeout)
+			require.True(t, timeout.Timeout())
+			if err == nil {
+				require.Equal(t, second.Addr().String(), conn.(*TCPConnection).RemoteAddr().String())
+			}
+		})
+	}
+}
+
 func TestTransportLayerClosing(t *testing.T) {
 	// NOTE it creates real network connection
 

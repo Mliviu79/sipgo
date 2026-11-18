@@ -33,9 +33,11 @@ var bufPool = sync.Pool{
 	},
 }
 
-type connectionPool struct {
+// ConnectionPool stores connections by remote address. Pools for unconnected
+// sockets can also index by local address. Obtain the live pool through TransportLayer.Pool.
+type ConnectionPool struct {
 	// TODO consider sync.Map way with atomic checks to reduce mutex contention
-	sync.RWMutex
+	mu sync.RWMutex
 	m  map[string]Connection
 	sf singleflight.Group
 
@@ -51,18 +53,18 @@ type connectionPool struct {
 // transport has already been closed.
 var errPoolClosed = errors.New("connection pool is closed")
 
-func newConnectionPool() *connectionPool {
-	p := &connectionPool{}
+func newConnectionPool() *ConnectionPool {
+	p := &ConnectionPool{}
 	p.init()
 	return p
 }
 
-func (p *connectionPool) init() {
+func (p *ConnectionPool) init() {
 	p.m = make(map[string]Connection)
 }
 
-func (p *connectionPool) addSingleflight(raddr Addr, laddr Addr, reuse bool, do func() (Connection, error)) (Connection, error) {
-	return p.addSingleflightWithAliases(raddr, laddr, reuse, nil, do)
+func (p *ConnectionPool) addSingleflight(raddr Addr, laddr Addr, reuse, reuseByLocalAddr bool, do func() (Connection, error)) (Connection, error) {
+	return p.addSingleflightWithAliases(raddr, laddr, reuse, reuseByLocalAddr, nil, do)
 }
 
 // addSingleflightWithAliases is addSingleflight plus extra keys the same
@@ -77,12 +79,13 @@ func (p *connectionPool) addSingleflight(raddr Addr, laddr Addr, reuse bool, do 
 // open and healthy, so an inbound request arriving on that socket cannot be
 // matched back to it.
 //
-// Aliases are additive: they never replace the raddr and local-address keys, and
-// passing none reproduces addSingleflight exactly.
-func (p *connectionPool) addSingleflightWithAliases(raddr Addr, laddr Addr, reuse bool, aliases []string, do func() (Connection, error)) (Connection, error) {
-	p.RLock()
+// Aliases are additive: they never replace the raddr key, nor the local-address
+// key of a pool that indexes by it, and passing none reproduces addSingleflight
+// exactly.
+func (p *ConnectionPool) addSingleflightWithAliases(raddr Addr, laddr Addr, reuse, reuseByLocalAddr bool, aliases []string, do func() (Connection, error)) (Connection, error) {
+	p.mu.RLock()
 	closed := p.closed
-	p.RUnlock()
+	p.mu.RUnlock()
 	if closed {
 		return nil, errPoolClosed
 	}
@@ -90,10 +93,12 @@ func (p *connectionPool) addSingleflightWithAliases(raddr Addr, laddr Addr, reus
 	a := raddr.String()
 
 	// register records every key this connection answers to. Both paths below
-	// call it with p.Lock held.
+	// call it with p.mu held.
 	register := func(c Connection) {
 		p.m[a] = c
-		p.m[c.LocalAddr().String()] = c
+		if reuseByLocalAddr {
+			p.m[c.LocalAddr().String()] = c
+		}
 		for _, alias := range aliases {
 			if alias == "" {
 				continue
@@ -107,14 +112,12 @@ func (p *connectionPool) addSingleflightWithAliases(raddr Addr, laddr Addr, reus
 		laddrStr := laddr.String()
 		// We create or return existing
 		conn, err, _ := p.sf.Do(laddrStr+a, func() (any, error) {
-			if laddr.Port > 0 {
-				if c := p.getUnref(laddrStr); c != nil {
-					return c, nil
-				}
-			} else {
-				if c := p.getUnref(a); c != nil {
-					return c, nil
-				}
+			key := a
+			if reuseByLocalAddr && laddr.Port > 0 {
+				key = laddrStr
+			}
+			if c := p.getUnref(key); c != nil && (laddr.IP == nil || laddr.Port == 0 || c.LocalAddr().String() == laddrStr) {
+				return c, nil
 			}
 
 			c, err := do()
@@ -125,8 +128,8 @@ func (p *connectionPool) addSingleflightWithAliases(raddr Addr, laddr Addr, reus
 			// Singleflight will return cached so we need todo this
 			c.Ref(-1)
 
-			p.Lock()
-			defer p.Unlock()
+			p.mu.Lock()
+			defer p.mu.Unlock()
 
 			if p.closed {
 				// Cleared while this connection was being dialled.
@@ -149,8 +152,8 @@ func (p *connectionPool) addSingleflightWithAliases(raddr Addr, laddr Addr, reus
 		return nil, err
 	}
 
-	p.Lock()
-	defer p.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	if p.closed {
 		// Cleared while this connection was being dialled.
@@ -164,21 +167,21 @@ func (p *connectionPool) addSingleflightWithAliases(raddr Addr, laddr Addr, reus
 	return c, nil
 }
 
-func (p *connectionPool) Add(a string, c Connection) {
+func (p *ConnectionPool) Add(a string, c Connection) {
 	// TODO how about multi connection support for same remote address
 	// We can then check ref count
 
 	if c.Ref(0) < 1 {
 		c.Ref(1) // Make 1 reference count by default
 	}
-	p.Lock()
+	p.mu.Lock()
 	p.m[a] = c
-	p.Unlock()
+	p.mu.Unlock()
 }
 
 // Getting connection pool increases reference
 // Make sure you TryClose after finish
-func (p *connectionPool) Get(a string) (c Connection) {
+func (p *ConnectionPool) Get(a string) (c Connection) {
 	// p.RLock()
 	// c, exists := p.m[a]
 	// p.RUnlock()
@@ -193,21 +196,22 @@ func (p *connectionPool) Get(a string) (c Connection) {
 	return c
 }
 
-func (p *connectionPool) getUnref(a string) (c Connection) {
-	p.RLock()
+func (p *ConnectionPool) getUnref(a string) (c Connection) {
+	p.mu.RLock()
 	c, exists := p.m[a]
-	p.RUnlock()
+	p.mu.RUnlock()
 	if !exists {
 		return nil
 	}
 	return c
 }
 
-// CloseAndDelete closes connection and deletes from pool
-func (p *connectionPool) CloseAndDelete(c Connection, addr string) error {
-	p.Lock()
-	defer p.Unlock()
-	delete(p.m, addr)
+// CloseAndDelete closes c and removes addr only if it still refers to c.
+// A replacement connection registered at addr is left in the pool.
+func (p *ConnectionPool) CloseAndDelete(c Connection, addr string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.deleteIfCurrentLocked(addr, c)
 	ref, _ := c.TryClose() // Be nice. Saves from double closing
 	if ref > 0 {
 		return c.Close()
@@ -215,24 +219,47 @@ func (p *connectionPool) CloseAndDelete(c Connection, addr string) error {
 	return nil
 }
 
-func (p *connectionPool) Delete(addr string) {
-	p.Lock()
-	defer p.Unlock()
+// Delete removes addr regardless of which connection it refers to.
+func (p *ConnectionPool) Delete(addr string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	delete(p.m, addr)
 }
 
-func (p *connectionPool) DeleteMultiple(addrs []string) {
-	p.Lock()
-	defer p.Unlock()
+// DeleteMultiple removes the addresses regardless of which connections they refer to.
+func (p *ConnectionPool) DeleteMultiple(addrs []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	for _, a := range addrs {
 		delete(p.m, a)
 	}
 }
 
+func (p *ConnectionPool) deleteExact(addr string, c Connection) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.deleteIfCurrentLocked(addr, c)
+}
+
+func (p *ConnectionPool) deleteExactN(addrs []string, c Connection) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, addr := range addrs {
+		p.deleteIfCurrentLocked(addr, c)
+	}
+}
+
+// deleteIfCurrentLocked requires p.mu to be held for writing.
+func (p *ConnectionPool) deleteIfCurrentLocked(addr string, c Connection) {
+	if p.m[addr] == c {
+		delete(p.m, addr)
+	}
+}
+
 // Clear will clear all connection from pool and close them
-func (p *connectionPool) Clear() error {
-	p.Lock()
-	defer p.Unlock()
+func (p *ConnectionPool) Clear() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	p.closed = true
 
@@ -251,9 +278,11 @@ func (p *connectionPool) Clear() error {
 	return werr
 }
 
-func (p *connectionPool) Size() int {
-	p.RLock()
+// Size returns the number of address entries in the pool. A connection may
+// occupy more than one entry.
+func (p *ConnectionPool) Size() int {
+	p.mu.RLock()
 	l := len(p.m)
-	p.RUnlock()
+	p.mu.RUnlock()
 	return l
 }

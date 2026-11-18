@@ -504,12 +504,15 @@ func (l *TransportLayer) ClientRequestConnection(ctx context.Context, req *Reque
 	laddr := req.Laddr
 	req.raddr = raddr
 
-	// This is probably client forcing host:port
-	if laddr.IP != nil && laddr.Port > 0 {
+	fixedLocalAddr := laddr.IP != nil && laddr.Port > 0
+	if fixedLocalAddr && network == "udp" {
 		c = transport.GetConnection(laddr.String())
-	} else if l.connectionReuse {
-		addr := raddr.String()
-		c = transport.GetConnection(addr)
+	} else if fixedLocalAddr || l.connectionReuse {
+		c = transport.GetConnection(raddr.String())
+		if c != nil && fixedLocalAddr && c.LocalAddr().String() != laddr.String() {
+			c.TryClose()
+			c = nil
+		}
 	}
 
 	if c == nil {
@@ -814,6 +817,26 @@ func (l *TransportLayer) resolveAddrSRV(ctx context.Context, network string, hos
 func (l *TransportLayer) GetConnection(network, addr string) (Connection, error) {
 	network = NetworkToLower(network)
 	return l.getConnection(network, addr)
+}
+
+// Pool returns the selected transport's live connection pool. Network names
+// are case insensitive. It returns nil for an unsupported network. Mutating
+// the returned pool affects the active transport.
+func (l *TransportLayer) Pool(network string) *ConnectionPool {
+	switch NetworkToLower(network) {
+	case "udp":
+		return l.udp.pool
+	case "tcp":
+		return l.tcp.pool
+	case "tls":
+		return l.tls.pool
+	case "ws":
+		return l.ws.pool
+	case "wss":
+		return l.wss.pool
+	default:
+		return nil
+	}
 }
 
 func (l *TransportLayer) getConnection(network, addr string) (Connection, error) {

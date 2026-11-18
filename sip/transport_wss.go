@@ -106,7 +106,7 @@ func (t *TransportWSS) CreateConnection(ctx context.Context, laddr Addr, raddr A
 	//
 	// The aliases cover the address forms other than the dialled one; see
 	// wsConnectionAliases.
-	conn, err := t.pool.addSingleflightWithAliases(raddr, laddr, t.connectionReuse, wsConnectionAliases(raddr), func() (Connection, error) {
+	conn, err := t.pool.addSingleflightWithAliases(raddr, laddr, t.connectionReuse, false, wsConnectionAliases(raddr), func() (Connection, error) {
 		// We need to distict IPAddr vs address with hostname
 		// Hostname must be passed for TLS if provided due to certificates check
 		hostname := raddr.Hostname

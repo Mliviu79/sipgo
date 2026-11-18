@@ -20,6 +20,26 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestClientRequestDecreaseMaxForward(t *testing.T) {
+	for _, value := range []uint32{0, 1, 2, 70} {
+		t.Run(fmt.Sprint(value), func(t *testing.T) {
+			req, err := sip.NewParser().ParseSIP([]byte(fmt.Sprintf(
+				"OPTIONS sip:example.com SIP/2.0\r\nMax-Forwards: %d\r\nContent-Length: 0\r\n\r\n", value)))
+			require.NoError(t, err)
+			request := req.(*sip.Request)
+			err = ClientRequestDecreaseMaxForward(nil, request)
+			if value == 0 {
+				require.Error(t, err)
+				require.Zero(t, request.MaxForwards().Val())
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, value-1, request.MaxForwards().Val())
+			}
+		})
+	}
+	require.NoError(t, ClientRequestDecreaseMaxForward(nil, sip.NewRequest(sip.OPTIONS, sip.Uri{Host: "example.com"})))
+}
+
 func TestClientRequestBuild(t *testing.T) {
 	// ua, err := NewUA(WithUserAgentIP(net.ParseIP("10.0.0.0")))
 	ua, err := NewUA(
@@ -288,6 +308,58 @@ type clientTxRequesterFunc func(ctx context.Context, req *sip.Request) (sip.Clie
 
 func (f clientTxRequesterFunc) Request(ctx context.Context, req *sip.Request) (sip.ClientTransaction, error) {
 	return f(ctx, req)
+}
+
+func testCreateOptions(recipient sip.Uri, transport string) *sip.Request {
+	req := sip.NewRequest(sip.OPTIONS, recipient)
+	req.SetTransport(transport)
+	return req
+}
+
+func TestClientNonInviteRetransmitsAfterTrying(t *testing.T) {
+	t1, t2, t4 := sip.T1, sip.T2, sip.T4
+	sip.SetTimers(50*time.Millisecond, 200*time.Millisecond, time.Second)
+	t.Cleanup(func() { sip.SetTimers(t1, t2, t4) })
+
+	ua, err := NewUA()
+	require.NoError(t, err)
+	defer ua.Close()
+	client, err := NewClient(ua)
+	require.NoError(t, err)
+
+	done := make(chan struct{})
+	client.TxRequester = &siptest.ClientTxRequesterResponder{
+		OnRequest: func(req *sip.Request, w *siptest.ClientTxResponder) {
+			defer close(done)
+			// Wait until Timer E reaches T2 before sending 100 Trying (RFC 4320).
+			if !assert.Eventually(t, func() bool {
+				return len(w.Requests()) >= 3
+			}, time.Second, time.Millisecond) {
+				return
+			}
+			w.Receive(sip.NewResponseFromRequest(req, sip.StatusTrying, "Trying", nil))
+			w.Receive(sip.NewResponseFromRequest(req, sip.StatusTrying, "Trying", nil))
+
+			// The first final response is lost. Resend it only after receiving
+			// another copy of the OPTIONS request.
+			before := len(w.Requests())
+			if !assert.Eventually(t, func() bool {
+				return len(w.Requests()) > before
+			}, time.Second, time.Millisecond) {
+				return
+			}
+			requests := w.Requests()
+			assert.Equal(t, requests[0].String(), requests[len(requests)-1].String())
+			w.Receive(sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil))
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req := testCreateOptions(sip.Uri{Host: "localhost", Port: 5060}, "UDP")
+	res, err := client.Do(ctx, req)
+	<-done
+	require.NoError(t, err)
+	require.Equal(t, sip.StatusOK, res.StatusCode)
 }
 
 func TestIntegrationClientViaBindHost(t *testing.T) {

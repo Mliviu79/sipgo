@@ -20,7 +20,7 @@ type TransportTCP struct {
 	connectionReuse bool
 	readFilter      TransportReadFilter
 
-	pool *connectionPool
+	pool *ConnectionPool
 
 	DialerCreate func(laddr net.Addr) net.Dialer
 
@@ -113,7 +113,7 @@ func (t *TransportTCP) CreateConnection(ctx context.Context, laddr Addr, raddr A
 	// 	return nil, err
 	// }
 	// We do singleflight if laddr is required or connection reuse
-	conn, err := t.pool.addSingleflight(raddr, laddr, t.connectionReuse, func() (Connection, error) {
+	conn, err := t.pool.addSingleflight(raddr, laddr, t.connectionReuse, false, func() (Connection, error) {
 		var tladdr *net.TCPAddr = nil
 		if laddr.IP != nil {
 			tladdr = &net.TCPAddr{
@@ -165,7 +165,6 @@ func (t *TransportTCP) initConnection(conn net.Conn, raddr string, handler Messa
 	laddr := conn.LocalAddr().String()
 	t.log.Debug("New connection", "raddr", raddr)
 	c := t.newConnection(conn, 1+TransportIdleConnection)
-	t.pool.Add(laddr, c)
 	t.pool.Add(raddr, c)
 	go t.readConnection(c, laddr, raddr, handler)
 	return c
@@ -174,7 +173,6 @@ func (t *TransportTCP) initConnection(conn net.Conn, raddr string, handler Messa
 // This should performe better to avoid any interface allocation
 func (t *TransportTCP) readConnection(conn *TCPConnection, laddr string, raddr string, handler MessageHandler) {
 	buf := make([]byte, TransportBufferReadSize)
-	defer t.pool.Delete(laddr)
 	defer func() {
 		if err := t.pool.CloseAndDelete(conn, raddr); err != nil {
 			t.log.Warn("connection pool not clean cleanup", "error", err)
@@ -241,7 +239,10 @@ func (t *TransportTCP) readConnection(conn *TCPConnection, laddr string, raddr s
 
 		// Check is keep alive
 		datalen := len(data)
-		if datalen <= 4 {
+		// RFC 5626 section 3.5.1 puts a keep alive between messages. A read is
+		// whatever TCP chose to deliver, so a CRLF ending a line of a message can
+		// arrive alone; only an idle parser can be between messages.
+		if datalen <= 4 && par.state == stateStartLine && par.Buffer().Len() == 0 {
 			// One or 2 CRLF
 			// https://datatracker.ietf.org/doc/html/rfc5626#section-3.5.1
 			if len(bytes.Trim(data, "\r\n")) == 0 {

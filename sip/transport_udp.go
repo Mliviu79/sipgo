@@ -20,7 +20,7 @@ var (
 type TransportUDP struct {
 	// listener *net.UDPConn
 	parser          *Parser
-	pool            *connectionPool
+	pool            *ConnectionPool
 	log             *slog.Logger
 	connectionReuse bool
 	readFilter      TransportReadFilter
@@ -93,7 +93,7 @@ func (t *TransportUDP) createConnection(ctx context.Context, laddr Addr, raddr A
 	}
 	addr := raddr.String()
 
-	conn, err := t.pool.addSingleflight(raddr, laddr, t.connectionReuse, func() (Connection, error) {
+	conn, err := t.pool.addSingleflight(raddr, laddr, t.connectionReuse, true, func() (Connection, error) {
 		udpconn, err := lc.ListenPacket(ctx, protocol, laddrStr)
 		if err != nil {
 			return nil, err
@@ -117,7 +117,7 @@ func (t *TransportUDP) createConnection(ctx context.Context, laddr Addr, raddr A
 }
 
 func (t *TransportUDP) readUDPConnection(conn *UDPConnection, raddr string, laddr string, handler MessageHandler) {
-	defer t.pool.Delete(raddr) // should be closed in previous defer
+	defer t.pool.deleteExact(raddr, conn) // should be closed in previous defer
 	t.readListenerConnection(conn, laddr, handler)
 }
 
@@ -139,7 +139,7 @@ func (t *TransportUDP) readListenerConnection(conn *UDPConnection, laddr string,
 		for addr := range acceptedAddr {
 			addrs = append(addrs, addr)
 		}
-		t.pool.DeleteMultiple(addrs)
+		t.pool.deleteExactN(addrs, conn)
 	}()
 
 	for {
@@ -148,6 +148,10 @@ func (t *TransportUDP) readListenerConnection(conn *UDPConnection, laddr string,
 			if errors.Is(err, net.ErrClosed) {
 				t.log.Debug("Read connection closed", "laddr", laddr, "error", err)
 				return
+			}
+			// Windows reports an error when a datagram exceeds the read buffer.
+			if isRecvMsgSizeErr(err) {
+				continue
 			}
 			t.log.Error("Read connection error", "laddr", laddr, "error", err)
 			return

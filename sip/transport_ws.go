@@ -48,7 +48,7 @@ type TransportWS struct {
 
 	connectionReuse bool
 
-	pool   *connectionPool
+	pool   *ConnectionPool
 	dialer ws.Dialer
 
 	DialerCreate func(laddr net.Addr) ws.Dialer
@@ -163,16 +163,26 @@ func (t *TransportWS) Serve(l net.Listener, handler MessageHandler) error {
 
 		log.Debug("New connection accept", "addr", raddr)
 
-		_, err = u.Upgrade(conn)
-		if err != nil {
-			log.Error("Fail to upgrade", "error", err)
-			if err := conn.Close(); err != nil {
-				log.Error("Closing connection failed", "error", err)
+		// A slow TLS or WebSocket handshake must not block further accepts.
+		go func() {
+			err := conn.SetDeadline(time.Now().Add(10 * time.Second))
+			if err == nil {
+				_, err = u.Upgrade(conn)
 			}
-			continue
-		}
+			if err == nil {
+				// Established connections use their own frame timeouts.
+				err = conn.SetDeadline(time.Time{})
+			}
+			if err != nil {
+				log.Error("Fail to upgrade", "error", err)
+				if err := conn.Close(); err != nil {
+					log.Error("Closing connection failed", "error", err)
+				}
+				return
+			}
 
-		t.initConnection(conn, raddr, false, handler)
+			t.initConnection(conn, raddr, false, handler)
+		}()
 	}
 }
 
@@ -182,10 +192,16 @@ func (t *TransportWS) initConnection(conn net.Conn, raddr string, clientSide boo
 	laddr := conn.LocalAddr().String()
 	t.log.Debug("New WS connection", "raddr", raddr)
 	c := t.newConnection(conn, 1+TransportIdleConnection, clientSide)
-	t.pool.Add(laddr, c)
 	t.pool.Add(raddr, c)
-	go t.readConnection(c, laddr, raddr, handler)
-	go c.keepalive(t.log)
+	// The keepalive sender stops when the connection closes, which the read
+	// loop does on its way out, so it is joined here.
+	keepaliveDone := make(chan struct{})
+	go func() {
+		defer close(keepaliveDone)
+		c.keepalive(t.log)
+	}()
+	t.readConnection(c, laddr, raddr, handler)
+	<-keepaliveDone
 	return c
 }
 
@@ -195,7 +211,6 @@ func (t *TransportWS) readConnection(conn *WSConnection, laddr string, raddr str
 	buf := make([]byte, TransportBufferReadSize)
 	// defer conn.Close()
 	// defer t.pool.Del(raddr)
-	defer t.pool.Delete(laddr)
 	defer func() {
 		if err := t.pool.CloseAndDelete(conn, raddr); err != nil {
 			t.log.Warn("connection pool not clean cleanup", "error", err)
@@ -207,9 +222,6 @@ func (t *TransportWS) readConnection(conn *WSConnection, laddr string, raddr str
 		}
 	}()
 	defer log.Debug("Websocket read connection stopped", "raddr", raddr)
-
-	// Create stream parser context
-	par := t.parser.NewSIPStream()
 
 	for {
 		num, err := conn.Read(buf)
@@ -254,32 +266,40 @@ func (t *TransportWS) readConnection(conn *WSConnection, laddr string, raddr str
 
 		// Check is keep alive
 		if len(data) <= 4 {
-			//One or 2 CRLF
+			// One or 2 CRLF (RFC 5626, section 3.5.1).
 			if len(bytes.Trim(data, "\r\n")) == 0 {
 				log.Debug("Keep alive CRLF received")
+				if bytes.Equal(data, []byte("\r\n\r\n")) {
+					if _, err := conn.Write(data[:2]); err != nil {
+						log.Error("Failed to pong keep alive", "error", err)
+						return
+					}
+				}
 				continue
 			}
 		}
 
-		t.parseStream(par, data, raddr, handler)
+		if err := t.parseMessage(data, raddr, handler); err != nil {
+			return
+		}
 	}
 
 }
 
-// TODO: Try to reuse this from TCP transport as func are same
-func (t *TransportWS) parseStream(par *ParserStream, data []byte, src string, handler MessageHandler) {
+func (t *TransportWS) parseMessage(data []byte, src string, handler MessageHandler) error {
 	msg, err := t.parser.ParseSIP(data) //Very expensive operationParseSIP
 	if err != nil {
 		// Any peer can reach this before it has authenticated, so it is not an
 		// application error and the payload is not ours to log. WSS reaches
 		// this through the TransportWS embed.
 		t.log.Debug("failed to parse", "src", src, "bytes", len(data), "error", err)
-		return
+		return err
 	}
 
 	msg.SetTransport(t.transport)
 	msg.SetSource(src)
 	handler(msg)
+	return nil
 }
 
 func (t *TransportWS) ResolveAddr(addr string) (net.Addr, error) {
@@ -291,7 +311,7 @@ func (t *TransportWS) GetConnection(addr string) Connection {
 }
 
 func (t *TransportWS) CreateConnection(ctx context.Context, laddr Addr, raddr Addr, handler MessageHandler) (Connection, error) {
-	conn, err := t.pool.addSingleflight(raddr, laddr, t.connectionReuse, func() (Connection, error) {
+	conn, err := t.pool.addSingleflight(raddr, laddr, t.connectionReuse, false, func() (Connection, error) {
 		var tladdr *net.TCPAddr = nil
 		if laddr.IP != nil {
 			tladdr = &net.TCPAddr{
@@ -342,12 +362,7 @@ type WSConnection struct {
 
 	mu       sync.RWMutex
 	refcount int
-
-	// writeMu serializes frame writes on Conn. ws frame writing is not safe for
-	// concurrent use on a single net.Conn, and pings from the keepalive
-	// goroutine and pongs from the read goroutine may now race WriteMsg. Without
-	// this two frames can interleave on the wire and neither one decodes.
-	writeMu sync.Mutex
+	writeMu  sync.Mutex
 
 	// closeCh is closed once the connection is hard closed, so that the
 	// keepalive goroutine stops.
@@ -369,41 +384,6 @@ func (c *WSConnection) signalClose() {
 	c.closeOnce.Do(func() { close(c.closeCh) })
 }
 
-func (c *WSConnection) state() ws.State {
-	if c.clientSide {
-		return ws.StateClientSide
-	}
-	return ws.StateServerSide
-}
-
-// armWriteDeadline sets the write deadline for the frame about to be written to
-// now plus writeTimeout. A net.Conn deadline is absolute, so a frame written
-// under the deadline a previous write left behind fails once that moment has
-// passed, even on a healthy connection that has only been quiet. Callers hold
-// writeMu, which ties the deadline to the frame they write next; it must never
-// be called without that lock, or a concurrent writer's deadline could be moved
-// under it. A non-positive writeTimeout means no deadline and leaves the
-// connection untouched.
-func (c *WSConnection) armWriteDeadline() error {
-	if c.writeTimeout <= 0 {
-		return nil
-	}
-	return c.Conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
-}
-
-// writeFrame writes a single frame under writeMu, with a fresh write deadline
-// armed for it. SIP data and keepalive pings go through here; the only other
-// frame writer is handleControlFrame, which writes the pong answering a peer's
-// ping under the same lock and arms its own deadline.
-func (c *WSConnection) writeFrame(f ws.Frame) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	if err := c.armWriteDeadline(); err != nil {
-		return err
-	}
-	return ws.WriteFrame(c.Conn, f)
-}
-
 // keepalive sends a Ping frame every TransportWSKeepAlivePeriod until the
 // connection is closed. A failed write means the connection is gone, so it is
 // closed to wake up the read goroutine and let the pool clean up.
@@ -420,11 +400,7 @@ func (c *WSConnection) keepalive(log *slog.Logger) {
 		case <-c.closeCh:
 			return
 		case <-ticker.C:
-			f := ws.NewPingFrame(nil)
-			if c.clientSide {
-				f = ws.MaskFrameInPlace(f)
-			}
-			if err := c.writeFrame(f); err != nil {
+			if _, err := c.writeFrame(ws.OpPing, nil); err != nil {
 				log.Debug("WS keepalive ping failed, closing connection", "ip", c.RemoteAddr().String(), "error", err)
 				// Close only the underlying conn and leave the refcount alone, so
 				// the read goroutine wakes up and the pool runs its normal
@@ -476,26 +452,6 @@ func (c *WSConnection) TryClose() (int, error) {
 	return ref, c.Conn.Close()
 }
 
-// handleControlFrame answers a Ping with a Pong and discards a Pong, reading the
-// control payload out of reader either way. The write lock is held across the
-// whole handler because it may write a header and payload separately, and those
-// must not be split by a concurrent Write. It is the one frame writer besides
-// writeFrame, so it arms its own fresh write deadline under the same lock.
-func (c *WSConnection) handleControlFrame(header ws.Header, reader io.Reader, state ws.State) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	if err := c.armWriteDeadline(); err != nil {
-		return err
-	}
-	return wsutil.ControlHandler{
-		Src: reader,
-		Dst: c.Conn,
-		// reader already unmasks the payload it yields.
-		DisableSrcCiphering: true,
-		State:               state,
-	}.Handle(header)
-}
-
 func (c *WSConnection) Read(b []byte) (n int, err error) {
 	if c.readTimeout > 0 {
 		if err := c.Conn.SetReadDeadline(time.Now().Add(c.readTimeout)); err != nil {
@@ -503,9 +459,27 @@ func (c *WSConnection) Read(b []byte) (n int, err error) {
 		}
 	}
 
-	state := c.state()
+	state := ws.StateServerSide
+	if c.clientSide {
+		state = ws.StateClientSide
+	}
 	reader := wsutil.NewReader(c.Conn, state)
 	reader.MaxFrameSize = int64(ParseMaxMessageLength)
+	handleControl := func(header ws.Header, src io.Reader) error {
+		if header.OpCode == ws.OpClose {
+			return net.ErrClosed
+		}
+		data := make([]byte, header.Length)
+		if _, err := io.ReadFull(src, data); err != nil {
+			return err
+		}
+		if header.OpCode == ws.OpPing {
+			_, err := c.writeFrame(ws.OpPong, data)
+			return err
+		}
+		return nil
+	}
+	reader.OnIntermediate = handleControl
 	for {
 		header, err := reader.NextFrame()
 		if err != nil {
@@ -521,14 +495,11 @@ func (c *WSConnection) Read(b []byte) (n int, err error) {
 		}
 
 		if header.OpCode.IsControl() {
-			if header.OpCode == ws.OpClose {
-				return n, net.ErrClosed
-			}
-			// Ping must be answered with a Pong carrying the same payload, and
-			// any control payload must be read out of the stream, otherwise the
-			// next header read starts mid payload. See RFC 6455 section 5.5.
-			if err := c.handleControlFrame(header, reader, state); err != nil {
-				return n, err
+			// NextFrame already handles control frames within fragmented messages.
+			if !reader.State.Fragmented() {
+				if err := handleControl(header, reader); err != nil {
+					return n, err
+				}
 			}
 			continue
 		}
@@ -540,7 +511,7 @@ func (c *WSConnection) Read(b []byte) (n int, err error) {
 		// 	continue
 		// }
 
-		if header.OpCode&ws.OpText == 0 {
+		if header.OpCode != ws.OpText && header.OpCode != ws.OpContinuation {
 			if err := reader.Discard(); err != nil {
 				return 0, err
 			}
@@ -550,13 +521,9 @@ func (c *WSConnection) Read(b []byte) (n int, err error) {
 		data := make([]byte, header.Length)
 
 		// Read until
-		_, err = io.ReadFull(c.Conn, data)
+		_, err = io.ReadFull(reader, data)
 		if err != nil {
 			return n, err
-		}
-
-		if header.Masked {
-			ws.Cipher(data, header.Mask, 0)
 		}
 
 		// header.Masked = false
@@ -575,15 +542,28 @@ func (c *WSConnection) Read(b []byte) (n int, err error) {
 }
 
 func (c *WSConnection) Write(b []byte) (n int, err error) {
-	if SIPDebug {
+	return c.writeFrame(ws.OpText, b)
+}
+
+func (c *WSConnection) writeFrame(op ws.OpCode, b []byte) (n int, err error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	if c.writeTimeout > 0 {
+		if err := c.Conn.SetWriteDeadline(time.Now().Add(c.writeTimeout)); err != nil {
+			return 0, err
+		}
+	}
+
+	if SIPDebug && op == ws.OpText {
 		logSIPWrite("WS", c.Conn.LocalAddr().String(), c.Conn.RemoteAddr().String(), b)
 	}
 
-	fs := ws.NewFrame(ws.OpText, true, b)
+	fs := ws.NewFrame(op, true, b)
 	if c.clientSide {
 		fs = ws.MaskFrameInPlace(fs)
 	}
-	err = c.writeFrame(fs)
+	err = ws.WriteFrame(c.Conn, fs)
 
 	return len(b), err
 }

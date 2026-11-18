@@ -118,9 +118,11 @@ func TestTransportParseFailureLog(t *testing.T) {
 		}},
 		{"WS", func(t *testing.T, log *slog.Logger) {
 			tr := &TransportWS{log: log}
-			par := NewParser()
-			tr.init(par)
-			tr.parseStream(par.NewSIPStream(), malformedRegister, src, handler)
+			tr.init(NewParser())
+			// Logging the failure may not swallow it: the caller closes the
+			// connection on a parse error.
+			err := tr.parseMessage(malformedRegister, src, handler)
+			require.Error(t, err)
 		}},
 	}
 

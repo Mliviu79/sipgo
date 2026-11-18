@@ -45,14 +45,16 @@ func wssRaddr() Addr {
 // our own local address and under the far end's never -- which is what
 // transport_wss.go did, and why an inbound request could not be matched to an
 // open socket. UDP, TCP and WS always passed (raddr, laddr); this asserts the
-// pool's own contract so a caller cannot quietly disagree with it again.
+// pool's own contract so a caller cannot quietly disagree with it again. A
+// stream connection is indexed by its remote address only: a local-address key
+// could hand a request meant for one peer the stream to another.
 func TestConnectionPoolKeysOnRemoteAddr(t *testing.T) {
 	p := newConnectionPool()
 	raddr := Addr{IP: net.ParseIP("194.102.34.49"), Port: 8089}
 	laddr := Addr{IP: net.ParseIP("192.168.1.219"), Port: 46336}
 	conn := newTestConn("192.168.1.219:46336")
 
-	if _, err := p.addSingleflight(raddr, laddr, true, func() (Connection, error) {
+	if _, err := p.addSingleflight(raddr, laddr, true, false, func() (Connection, error) {
 		return conn, nil
 	}); err != nil {
 		t.Fatalf("addSingleflight() error = %v", err)
@@ -61,8 +63,8 @@ func TestConnectionPoolKeysOnRemoteAddr(t *testing.T) {
 	if got := p.getUnref(raddr.String()); got == nil {
 		t.Errorf("pool has no entry for raddr %q; an inbound request from the far end cannot find this connection", raddr.String())
 	}
-	if got := p.getUnref(laddr.String()); got == nil {
-		t.Errorf("pool has no entry for the local addr %q", laddr.String())
+	if got := p.getUnref(laddr.String()); got != nil {
+		t.Errorf("pool has an entry for the local addr %q of a stream connection, want none", laddr.String())
 	}
 }
 
@@ -137,7 +139,7 @@ func TestAddSingleflightWithAliasesRegistersEveryForm(t *testing.T) {
 	laddr := Addr{IP: net.ParseIP("192.168.1.219"), Port: 46336}
 	conn := newTestConn("192.168.1.219:46336")
 
-	if _, err := p.addSingleflightWithAliases(raddr, laddr, true, wsConnectionAliases(raddr), func() (Connection, error) {
+	if _, err := p.addSingleflightWithAliases(raddr, laddr, true, false, wsConnectionAliases(raddr), func() (Connection, error) {
 		return conn, nil
 	}); err != nil {
 		t.Fatalf("addSingleflightWithAliases() error = %v", err)
@@ -148,7 +150,6 @@ func TestAddSingleflightWithAliasesRegistersEveryForm(t *testing.T) {
 		"194.102.34.49",
 		"ct25.iset.ro:8089",
 		"ct25.iset.ro",
-		"192.168.1.219:46336", // local addr: still registered, aliases are additive
 	} {
 		if got := p.getUnref(key); got == nil {
 			t.Errorf("pool lookup %q = nil; inbound routing by this form would fail", key)
@@ -164,13 +165,13 @@ func TestAddSingleflightWithoutAliasesMatchesAddSingleflight(t *testing.T) {
 	laddr := Addr{IP: net.ParseIP("192.168.1.219"), Port: 46336}
 
 	p := newConnectionPool()
-	if _, err := p.addSingleflightWithAliases(raddr, laddr, true, nil, func() (Connection, error) {
+	if _, err := p.addSingleflightWithAliases(raddr, laddr, true, false, nil, func() (Connection, error) {
 		return newTestConn("192.168.1.219:46336"), nil
 	}); err != nil {
 		t.Fatalf("addSingleflightWithAliases() error = %v", err)
 	}
 
-	if p.Size() != 2 {
-		t.Errorf("pool size = %d, want 2 (raddr + local addr); aliases must not add keys when none are passed", p.Size())
+	if p.Size() != 1 {
+		t.Errorf("pool size = %d, want 1 (raddr); aliases must not add keys when none are passed", p.Size())
 	}
 }
