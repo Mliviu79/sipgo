@@ -127,6 +127,15 @@ func (s *DialogClientSession) buildReq(req *sip.Request) {
 		cseq.SeqNo++
 	}
 
+	// A CANCEL has the CSeq number of the INVITE it cancels (RFC 3261 section
+	// 9.1), which the dialog's last number no longer is once a request was
+	// sent inside the early dialog. InviteRequest is that INVITE as it was
+	// last sent: one sent again with credentials has taken its new number.
+	lastCSeqNo := cseq.SeqNo
+	if req.IsCancel() {
+		cseq.SeqNo = s.InviteRequest.CSeq().SeqNo
+	}
+
 	// Check record route header
 	// A CANCEL is not a request inside the dialog: its Request-URI, its Route
 	// header fields and where it is sent are those of the INVITE it cancels
@@ -157,7 +166,7 @@ func (s *DialogClientSession) buildReq(req *sip.Request) {
 		req.AppendHeader(sip.HeaderClone(&s.UA.ContactHDR))
 	}
 
-	s.lastCSeqNo.Store(cseq.SeqNo)
+	s.lastCSeqNo.Store(lastCSeqNo)
 	// Make sure transport matches original invite
 	req.SetTransport(s.InviteRequest.Transport())
 }
