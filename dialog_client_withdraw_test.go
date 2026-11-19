@@ -39,16 +39,24 @@ type scriptedPeer struct {
 	sent chan sentRequest
 }
 
+// newScriptedPeer returns a scriptedPeer and the client whose requests it
+// holds, for a dialog of either role to send on.
+func newScriptedPeer(t *testing.T) (*scriptedPeer, *Client) {
+	t.Helper()
+	p := &scriptedPeer{sent: make(chan sentRequest, 16)}
+	client := testClientResponder(t, func(req *sip.Request, w *siptest.ClientTxResponder) {
+		p.sent <- sentRequest{req: req, w: w}
+	})
+	return p, client
+}
+
 // newScriptedDialog sends an INVITE to a scriptedPeer, with the given headers
 // added to it, and returns both. It ends the INVITE transaction with the
 // test, so a response the dialog left unread does not hold its delivery past
 // the bubble.
 func newScriptedDialog(t *testing.T, headers ...sip.Header) (*scriptedPeer, *DialogClientSession) {
 	t.Helper()
-	p := &scriptedPeer{sent: make(chan sentRequest, 16)}
-	client := testClientResponder(t, func(req *sip.Request, w *siptest.ClientTxResponder) {
-		p.sent <- sentRequest{req: req, w: w}
-	})
+	p, client := newScriptedPeer(t)
 	dua := DialogUA{
 		Client:     client,
 		ContactHDR: sip.ContactHeader{Address: sip.Uri{User: "uac", Host: "127.0.0.1", Port: 5060}},

@@ -59,7 +59,9 @@ type Dialog struct {
 	remoteCSeqNo atomic.Uint32
 	// inviteCSeqNo is the CSeq number of the INVITE this side last sent in the
 	// dialog: the one that set it up, as it was last sent, or a re-INVITE. The
-	// ACK of that INVITE's 2xx carries it (RFC 3261 section 13.2.2.4).
+	// ACK of that INVITE's 2xx carries it (RFC 3261 section 13.2.2.4). It is
+	// zero on the side that answered the dialog until that side sends a
+	// re-INVITE.
 	inviteCSeqNo atomic.Uint32
 
 	// InviteResponse is last response received or sent. It is not thread safe!

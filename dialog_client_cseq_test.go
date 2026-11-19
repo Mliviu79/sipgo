@@ -17,9 +17,10 @@ import (
 // to.
 var peerContact = sip.Uri{User: "uas", Host: "127.0.0.1", Port: 5090}
 
-// sendInDialog has the dialog send a request of the given method to the peer
-// with Do, has the peer answer it 200, and returns the request the peer read.
-func sendInDialog(t *testing.T, p *scriptedPeer, d *DialogClientSession, method sip.RequestMethod) sentRequest {
+// sendInDialog has the dialog, of either role, send a request of the given
+// method to the peer with Do, has the peer answer it 200, and returns the
+// request the peer read.
+func sendInDialog(t *testing.T, p *scriptedPeer, d inDialogSession, method sip.RequestMethod) sentRequest {
 	t.Helper()
 	ctx := t.Context()
 	done := make(chan error, 1)

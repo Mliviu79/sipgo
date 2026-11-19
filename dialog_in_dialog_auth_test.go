@@ -43,21 +43,8 @@ var inDialogRoles = []inDialogRole{
 			t.Cleanup(func() { _ = ua.Close() })
 			cli, err := NewClient(ua, WithClientHostname("127.0.0.1"))
 			require.NoError(t, err)
-			dua := &DialogUA{
-				Client:     cli,
-				ContactHDR: sip.ContactHeader{Address: sip.Uri{User: "uas", Host: "127.0.0.1", Port: 5060}},
-			}
 			peer := sip.Uri{User: "peer", Host: "127.0.0.1", Port: u.port}
-			invite, _, _ := createTestInvite(t, "sip:uas@127.0.0.1", "UDP", fmt.Sprintf("127.0.0.1:%d", u.port))
-			invite.AppendHeader(&sip.ContactHeader{Address: peer})
-			tx := siptest.NewServerTxRecorder(invite)
-			t.Cleanup(tx.Terminate)
-			d, err := dua.ReadInvite(invite, tx)
-			require.NoError(t, err)
-			t.Cleanup(func() { _ = d.Close() })
-			d.InviteResponse = sip.NewResponseFromRequest(invite, sip.StatusOK, "OK", nil)
-			d.setState(sip.DialogStateConfirmed)
-			return d, peer
+			return newConfirmedServerDialog(t, cli, peer), peer
 		},
 	},
 	{
@@ -78,6 +65,27 @@ var inDialogRoles = []inDialogRole{
 			return d, d.InviteResponse.Contact().Address
 		},
 	},
+}
+
+// newConfirmedServerDialog returns a confirmed dialog that we answered and
+// whose requests go out through cli. The INVITE that set it up came from the
+// address of peer and carries peer as its Contact, the dialog's remote target.
+func newConfirmedServerDialog(t *testing.T, cli *Client, peer sip.Uri) *DialogServerSession {
+	t.Helper()
+	dua := &DialogUA{
+		Client:     cli,
+		ContactHDR: sip.ContactHeader{Address: sip.Uri{User: "uas", Host: "127.0.0.1", Port: 5060}},
+	}
+	invite, _, _ := createTestInvite(t, "sip:uas@127.0.0.1", "UDP", peer.HostPort())
+	invite.AppendHeader(&sip.ContactHeader{Address: peer})
+	tx := siptest.NewServerTxRecorder(invite)
+	t.Cleanup(tx.Terminate)
+	d, err := dua.ReadInvite(invite, tx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	d.InviteResponse = sip.NewResponseFromRequest(invite, sip.StatusOK, "OK", nil)
+	d.setState(sip.DialogStateConfirmed)
+	return d
 }
 
 // inDialogRow is a request sent inside the dialog and what the peer answers

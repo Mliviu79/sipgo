@@ -128,6 +128,19 @@ func (s *DialogServerSession) buildReq(req *sip.Request) {
 		cseq.SeqNo++
 	}
 
+	// An ACK has the CSeq number of the INVITE it acknowledges (RFC 3261
+	// section 13.2.2.4): the re-INVITE this side last sent, whose number the
+	// dialog's last number no longer is once a request was sent after it. A
+	// session that has sent no INVITE has none to acknowledge, and an ACK it
+	// builds keeps the dialog's last number.
+	lastCSeqNo := cseq.SeqNo
+	if req.IsInvite() {
+		s.inviteCSeqNo.Store(cseq.SeqNo)
+	}
+	if inviteCSeqNo := s.inviteCSeqNo.Load(); req.IsAck() && inviteCSeqNo != 0 {
+		cseq.SeqNo = inviteCSeqNo
+	}
+
 	// https://datatracker.ietf.org/doc/html/rfc3261#section-16.12.1.2
 	rrs := s.InviteRequest.GetHeaders("Record-Route")
 	for i := range rrs {
@@ -158,7 +171,7 @@ func (s *DialogServerSession) buildReq(req *sip.Request) {
 	// 	}
 	// }
 
-	s.lastCSeqNo.Store(cseq.SeqNo)
+	s.lastCSeqNo.Store(lastCSeqNo)
 
 	if h := req.Contact(); h == nil {
 		req.AppendHeader(sip.HeaderClone(&s.ua.ContactHDR))
