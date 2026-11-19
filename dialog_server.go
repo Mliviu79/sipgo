@@ -123,9 +123,12 @@ func (s *DialogServerSession) buildReq(req *sip.Request) {
 	// For safety make sure we are starting with our last dialog cseq num
 	cseq.SeqNo = s.lastCSeqNo.Load()
 
+	// A request takes the dialog's next CSeq number (RFC 3261 section
+	// 12.2.1.1), in one atomic step: requests built at the same time each
+	// take a number of their own. An ACK and a CANCEL are no requests of that
+	// sequence, and leave the dialog's last number as it is.
 	if !req.IsAck() && !req.IsCancel() {
-		// Do cseq increment within dialog
-		cseq.SeqNo++
+		cseq.SeqNo = s.lastCSeqNo.Add(1)
 	}
 
 	// An ACK has the CSeq number of the INVITE it acknowledges (RFC 3261
@@ -133,7 +136,6 @@ func (s *DialogServerSession) buildReq(req *sip.Request) {
 	// dialog's last number no longer is once a request was sent after it. A
 	// session that has sent no INVITE has none to acknowledge, and an ACK it
 	// builds keeps the dialog's last number.
-	lastCSeqNo := cseq.SeqNo
 	if req.IsInvite() {
 		s.inviteCSeqNo.Store(cseq.SeqNo)
 	}
@@ -170,8 +172,6 @@ func (s *DialogServerSession) buildReq(req *sip.Request) {
 	// 		*/
 	// 	}
 	// }
-
-	s.lastCSeqNo.Store(lastCSeqNo)
 
 	if h := req.Contact(); h == nil {
 		req.AppendHeader(sip.HeaderClone(&s.ua.ContactHDR))

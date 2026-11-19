@@ -25,6 +25,7 @@ type inDialogSession interface {
 	SetCredentials(auth DigestAuth)
 	LoadState() sip.DialogState
 	Context() context.Context
+	CSEQ() uint32
 }
 
 // inDialogRole sets up a confirmed dialog whose peer is a raw UAS, and returns
