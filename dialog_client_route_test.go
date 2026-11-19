@@ -12,9 +12,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// challengeSource is the address the peer's challenge comes from, which is
-// not the one the INVITE's Request-URI resolves to.
-const challengeSource = "192.0.2.10:5062"
+const (
+	// challengeSource is the address the peer's challenge comes from, which
+	// is not the one the INVITE's Request-URI resolves to.
+	challengeSource = "192.0.2.10:5062"
+	// ringingSource is the address the peer's 180 comes from, which is
+	// neither challengeSource nor the one the Request-URI resolves to.
+	ringingSource = "192.0.2.20:5064"
+)
 
 var (
 	// looseRouters are the Record-Route values of two proxies that route
@@ -139,6 +144,79 @@ func TestDialogClientChallengeRecordRoute(t *testing.T) {
 
 				giveUp(errGaveUp)
 				require.ErrorIs(t, <-waited, ErrInvitePending)
+			})
+		})
+	}
+}
+
+// TestDialogClientCancelRecordRoute has the caller withdraw an INVITE whose
+// provisional response carries Record-Route, or comes from another address
+// than the INVITE was sent to. The CANCEL is matched with the INVITE and
+// routed as it was, hop by hop, so it is the INVITE's Request-URI, Call-ID,
+// To, From, CSeq number, single Via and Route values, sent where the INVITE
+// was sent (RFC 3261 section 9.1): the route set of the early dialog the
+// provisional creates is for requests inside that dialog, which a CANCEL is
+// not, and RewriteContact does not move it to the provisional's source.
+func TestDialogClientCancelRecordRoute(t *testing.T) {
+	tests := []struct {
+		name string
+		// route holds the Route values the caller gives the INVITE.
+		route []string
+		// challenged has the peer challenge the INVITE first, from
+		// challengeSource, so the INVITE the CANCEL is of is the one sent
+		// again with credentials.
+		challenged bool
+		// recordRoutes holds the Record-Route values of the 180.
+		recordRoutes []string
+		// rewriteContact is the UA's RewriteContact.
+		rewriteContact bool
+	}{
+		{name: "LooseRouters", recordRoutes: looseRouters},
+		{name: "AStrictRouter", recordRoutes: strictRouter},
+		{name: "OverAPreExistingRoute", route: outboundProxy, recordRoutes: looseRouters},
+		{name: "RewriteContact", rewriteContact: true},
+		{name: "RewriteContactOverAPreExistingRoute", route: outboundProxy, rewriteContact: true},
+		{name: "AfterAChallenge", challenged: true, recordRoutes: looseRouters},
+		{name: "AfterAChallengeUnderRewriteContact", challenged: true, rewriteContact: true},
+		{name: "AfterAChallengeUnderRewriteContactWithRecordRoute", challenged: true, recordRoutes: strictRouter, rewriteContact: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				p, d := newScriptedDialog(t, headersOf("Route", tc.route)...)
+				d.UA.RewriteContact = tc.rewriteContact
+				ctx, giveUp := context.WithCancelCause(t.Context())
+				defer giveUp(nil)
+				waited := make(chan error, 1)
+				go func() { waited <- d.WaitAnswerLeavePending(ctx, challengeAnswer) }()
+
+				invite := p.next(t, sip.INVITE)
+				if tc.challenged {
+					challenge := p.challengeTo(invite)
+					challenge.SetSource(challengeSource)
+					p.deliver(invite, challenge)
+					invite = p.next(t, sip.INVITE)
+				}
+				want := wireOf(invite.req)
+				ringing := p.response(invite, sip.StatusRinging, "Ringing")
+				for _, h := range headersOf("Record-Route", tc.recordRoutes) {
+					ringing.AppendHeader(h)
+				}
+				ringing.SetSource(ringingSource)
+				p.deliver(invite, ringing)
+				giveUp(errGaveUp)
+				require.ErrorIs(t, <-waited, ErrInvitePending)
+
+				cancelled := cancelling(t.Context(), d)
+				cancelReq := p.next(t, sip.CANCEL)
+				assert.Equal(t, want, wireOf(cancelReq.req))
+				p.answer(cancelReq, sip.StatusOK, "OK")
+				p.answer(invite, sip.StatusRequestTerminated, "Request Terminated")
+
+				require.NoError(t, <-cancelled)
+				assert.True(t, inviteEnded(d), "the INVITE transaction is terminated")
+				p.sentNothing(t)
 			})
 		})
 	}

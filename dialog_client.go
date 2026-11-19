@@ -128,7 +128,10 @@ func (s *DialogClientSession) buildReq(req *sip.Request) {
 	}
 
 	// Check record route header
-	if s.InviteResponse != nil {
+	// A CANCEL is not a request inside the dialog: its Request-URI, its Route
+	// header fields and where it is sent are those of the INVITE it cancels
+	// (RFC 3261 section 9.1), which it is built with.
+	if s.InviteResponse != nil && !req.IsCancel() {
 		hdrs := routeSetRecordRoutes(s.InviteResponse)
 		// More on
 		// https://datatracker.ietf.org/doc/html/rfc3261#section-16.12.1.1
@@ -881,6 +884,10 @@ func newByeRequestUAC(inviteRequest *sip.Request, inviteResponse *sip.Response, 
 	return byeRequest
 }
 
+// newCancelRequest creates the CANCEL of inviteRequest, which RFC 3261 section
+// 9.1 has a server match with the INVITE and every hop route as it routed the
+// INVITE: it has the INVITE's Request-URI, From, To, Call-ID, top Via and
+// Route header fields, and is sent where the INVITE is sent.
 func newCancelRequest(inviteRequest *sip.Request) *sip.Request {
 	cancelReq := sip.NewRequest(sip.CANCEL, inviteRequest.Recipient)
 	cancelReq.AppendHeader(sip.HeaderClone(inviteRequest.Via())) // Cancel request must match invite TOP via and only have that Via
@@ -889,6 +896,7 @@ func newCancelRequest(inviteRequest *sip.Request) *sip.Request {
 	cancelReq.AppendHeader(sip.HeaderClone(inviteRequest.CallID()))
 	sip.CopyHeaders("Route", inviteRequest, cancelReq)
 	cancelReq.SetSource(inviteRequest.Source())
+	cancelReq.SetDestination(inviteRequest.Destination())
 	cancelReq.Laddr = inviteRequest.Laddr
 	return cancelReq
 }
