@@ -66,7 +66,17 @@ func (s *DialogServerSession) Do(ctx context.Context, req *sip.Request) (*sip.Re
 // TransactionRequest is doing client DIALOG request based on RFC
 // https://www.rfc-editor.org/rfc/rfc3261#section-12.2.1
 // This ensures that you have proper request done within dialog
+//
+// Requests sent at the same time on one session each take a CSeq number of
+// their own, and are handed to their transactions in the order of those
+// numbers.
 func (s *DialogServerSession) TransactionRequest(ctx context.Context, req *sip.Request) (sip.ClientTransaction, error) {
+	// The request is numbered and handed to its transaction in one step, so a
+	// request numbered after it is handed over after it, see sendMu. The lock
+	// is held over the hand-off for that, and no longer: the caller waits for
+	// the answer without it.
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
 	s.buildReq(req)
 	// Passing option to avoid CSEQ apply
 	return s.ua.Client.TransactionRequest(ctx, req, func(c *Client, req *sip.Request) error {
@@ -81,7 +91,14 @@ func (s *DialogServerSession) TransactionRequest(ctx context.Context, req *sip.R
 	})
 }
 
+// WriteRequest builds req as a request inside the dialog, as
+// TransactionRequest does, and writes it to the transport with no client
+// transaction. Requests sent at the same time on one session are written in
+// the order of their CSeq numbers.
 func (s *DialogServerSession) WriteRequest(req *sip.Request) error {
+	// Numbered and written in one step, as TransactionRequest does.
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
 	s.buildReq(req)
 	return s.ua.Client.WriteRequest(req)
 }

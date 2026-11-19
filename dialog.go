@@ -63,6 +63,16 @@ type Dialog struct {
 	// zero on the side that answered the dialog until that side sends a
 	// re-INVITE.
 	inviteCSeqNo atomic.Uint32
+	// sendMu makes one step of taking a request's CSeq number and handing the
+	// request to its client transaction, or to the transport, so the requests
+	// of the dialog reach the transaction layer in the order of their numbers:
+	// RFC 3261 section 12.2.2 has the peer reject a request whose number is
+	// lower than that of one it has already read. It is released once the
+	// request is handed over, before anything waits for the peer's answer.
+	// The hand-off writes the request to its connection, so a write that
+	// blocks, as on a stream connection the peer has stopped reading, holds
+	// the dialog's other senders for as long as the transport lets it.
+	sendMu sync.Mutex
 
 	// InviteResponse is last response received or sent. It is not thread safe!
 	// Use it only as read only and do not change values
@@ -123,16 +133,34 @@ func (d *Dialog) finalAnswer(ctx context.Context, c *Client, req *sip.Request, t
 	if retry == nil {
 		return res, nil
 	}
-	tx, err = c.TransactionRequest(ctx, retry, ClientRequestAddVia)
+	tx, err = d.transactionAuthorized(ctx, c, retry)
 	if err != nil {
 		return nil, err
 	}
 	return waitFinal(ctx, tx)
 }
 
+// transactionAuthorized gives retry, the copy authorizedCopy made of a request
+// of the dialog, the dialog's next CSeq number and hands it to a client
+// transaction of c, which it returns. The two are one step, see sendMu: the
+// copy is numbered among the requests other goroutines send inside the dialog
+// meanwhile, and reaches the transaction layer in the order of that number.
+func (d *Dialog) transactionAuthorized(ctx context.Context, c *Client, retry *sip.Request) (sip.ClientTransaction, error) {
+	d.sendMu.Lock()
+	defer d.sendMu.Unlock()
+	retry.CSeq().SeqNo = d.lastCSeqNo.Add(1)
+	if retry.IsInvite() {
+		// The 2xx of a re-INVITE sent again answers this copy, so its ACK
+		// has this copy's number.
+		d.inviteCSeqNo.Store(retry.CSeq().SeqNo)
+	}
+	return c.TransactionRequest(ctx, retry, ClientRequestAddVia)
+}
+
 // authorizedCopy returns a copy of req, which res answered, that answers the
-// challenge res carries with the dialog's credentials, with no Via and with
-// the dialog's next CSeq. It returns nil when res carries no challenge or the
+// challenge res carries with the dialog's credentials, with no Via. The copy
+// has req's CSeq number: it takes the dialog's next when it is sent, see
+// transactionAuthorized. It returns nil when res carries no challenge or the
 // dialog holds no credentials.
 func (d *Dialog) authorizedCopy(req *sip.Request, res *sip.Response) (*sip.Request, error) {
 	auth, ok := d.Credentials()
@@ -158,12 +186,6 @@ func (d *Dialog) authorizedCopy(req *sip.Request, res *sip.Response) (*sip.Reque
 		Password: auth.Password,
 	}); err != nil {
 		return nil, err
-	}
-	retry.CSeq().SeqNo = d.lastCSeqNo.Add(1)
-	if retry.IsInvite() {
-		// The 2xx of a re-INVITE sent again answers this copy, so its ACK
-		// has this copy's number.
-		d.inviteCSeqNo.Store(retry.CSeq().SeqNo)
 	}
 	return retry, nil
 }

@@ -63,14 +63,31 @@ func (s *DialogClientSession) Do(ctx context.Context, req *sip.Request) (*sip.Re
 // TransactionRequest is doing subsequent client DIALOG request based on RFC after initial session (INVITE) setup
 // https://www.rfc-editor.org/rfc/rfc3261#section-12.2.1
 // This ensures that you have proper request done within dialog. You should avoid setting any Dialog header (cseq, from, to, callid)
+//
+// Requests sent at the same time on one session each take a CSeq number of
+// their own, and are handed to their transactions in the order of those
+// numbers.
 func (s *DialogClientSession) TransactionRequest(ctx context.Context, req *sip.Request) (sip.ClientTransaction, error) {
+	// The request is numbered and handed to its transaction in one step, so a
+	// request numbered after it is handed over after it, see sendMu. The lock
+	// is held over the hand-off for that, and no longer: the caller waits for
+	// the answer without it.
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
 	s.buildReq(req)
 
 	// Passing option to avoid CSEQ apply
 	return s.UA.Client.TransactionRequest(ctx, req, s.requestValidate)
 }
 
+// WriteRequest builds req as a request inside the dialog, as
+// TransactionRequest does, and writes it to the transport with no client
+// transaction. Requests sent at the same time on one session are written in
+// the order of their CSeq numbers.
 func (s *DialogClientSession) WriteRequest(req *sip.Request) error {
+	// Numbered and written in one step, as TransactionRequest does.
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
 	s.buildReq(req)
 	return s.UA.Client.WriteRequest(req, s.requestValidate)
 }
@@ -712,6 +729,10 @@ func (s *DialogClientSession) WriteAck(ctx context.Context, ack *sip.Request) er
 	// request is passed to the transport layer directly for transmission,
 	// rather than a client transaction.  This is because the UAC core
 	// handles retransmissions of the ACK, not the transaction layer.
+	//
+	// The ACK takes the number of its INVITE and none of the dialog's
+	// sequence, so there is no order to keep between it and the requests sent
+	// meanwhile, and it is built and written outside sendMu.
 	s.buildReq(ack)
 	if err := s.requestValidate(s.UA.Client, ack); err != nil {
 		return err
