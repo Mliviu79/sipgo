@@ -538,3 +538,85 @@ func TestDialogClientCancelAnsweredAckBye(t *testing.T) {
 	u.respond(t, u.expect(t, sip.BYE), sip.StatusOK)
 	require.NoError(t, <-bye)
 }
+
+// waitingAnswer starts WaitAnswer on ctx and returns the channel its result
+// arrives on.
+func waitingAnswer(ctx context.Context, d *DialogClientSession) <-chan error {
+	answered := make(chan error, 1)
+	go func() { answered <- d.WaitAnswer(ctx, AnswerOptions{}) }()
+	return answered
+}
+
+// TestDialogClientWaitAnswerContextEnds has the context of WaitAnswer end
+// before a final response. WaitAnswer has no context that outlives it, so it
+// withdraws the INVITE itself, and that withdrawal ends on the timers of RFC
+// 3261 alone: with the CANCEL answered and no final for the INVITE it returns
+// the context's error 64*T1 later (section 9.1). A refusal that comes before
+// a provisional let a CANCEL be sent is not reported as the context's end,
+// and a context ended with WaitAnswerForceCancelErr sends no CANCEL at all.
+// The INVITE transaction is terminated each time.
+func TestDialogClientWaitAnswerContextEnds(t *testing.T) {
+	t.Run("NoFinalWithin64T1", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			p, d := newScriptedDialog(t)
+			ctx, giveUp := context.WithCancelCause(t.Context())
+			defer giveUp(nil)
+			answered := waitingAnswer(ctx, d)
+			p.answer(p.next(t, sip.INVITE), sip.StatusRinging, "Ringing")
+
+			start := time.Now()
+			giveUp(errGaveUp)
+			p.answer(p.next(t, sip.CANCEL), sip.StatusOK, "OK")
+
+			err := <-answered
+			require.ErrorIs(t, err, context.Canceled)
+			assert.Equal(t, 64*sip.T1, time.Since(start))
+			var answer *ErrAnsweredAfterCancel
+			assert.False(t, errors.As(err, &answer), "no 2xx answered the INVITE")
+			assert.True(t, inviteEnded(d), "the INVITE transaction is terminated")
+			p.sentNothing(t)
+		})
+	})
+
+	t.Run("RefusedBeforeProvisional", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			p, d := newScriptedDialog(t)
+			ctx, giveUp := context.WithCancelCause(t.Context())
+			defer giveUp(nil)
+			answered := waitingAnswer(ctx, d)
+			invite := p.next(t, sip.INVITE)
+
+			giveUp(errGaveUp)
+			p.sentNothing(t)
+			final := p.answer(invite, sip.StatusBusyHere, "Busy Here")
+
+			err := <-answered
+			require.Error(t, err)
+			assert.NotErrorIs(t, err, context.Canceled, "the refusal is not the context's end")
+			var answer *ErrAnsweredAfterCancel
+			assert.False(t, errors.As(err, &answer), "no 2xx answered the INVITE")
+			assert.Same(t, final, d.InviteResponse)
+			assert.True(t, inviteEnded(d), "the INVITE transaction is terminated")
+			p.sentNothing(t)
+		})
+	})
+
+	t.Run("ForcedCancel", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			p, d := newScriptedDialog(t)
+			ctx, giveUp := context.WithCancelCause(t.Context())
+			defer giveUp(nil)
+			answered := waitingAnswer(ctx, d)
+			p.answer(p.next(t, sip.INVITE), sip.StatusRinging, "Ringing")
+
+			start := time.Now()
+			giveUp(WaitAnswerForceCancelErr)
+
+			err := <-answered
+			require.ErrorIs(t, err, context.Canceled)
+			assert.Zero(t, time.Since(start), "no CANCEL is waited for")
+			assert.True(t, inviteEnded(d), "the INVITE transaction is terminated")
+			p.sentNothing(t)
+		})
+	})
+}

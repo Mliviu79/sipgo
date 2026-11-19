@@ -248,8 +248,8 @@ type ErrAnsweredAfterCancel struct {
 	// Res is the 2xx that answered the INVITE.
 	Res *sip.Response
 	// Err is the error of the context that made the caller give up, which
-	// WaitAnswer and WaitAnswerWithCancelContext set. It is nil when Cancel
-	// returns the error: Cancel is not given that context.
+	// WaitAnswer sets. It is nil when Cancel returns the error: Cancel is not
+	// given that context.
 	Err error
 }
 
@@ -276,33 +276,31 @@ const maxAuthAttempts = 2
 // Canceling context while waiting 2xx will send Cancel request. It will block until 1xx provisional is not received
 // If Canceling succesfull context.Canceled error is returned
 // Returns errors:
-// - ErrDialogResponse in case non 2xx response
+// - *ErrDialogResponse in case non 2xx response
 // - ErrAuthMissingCreds when a real challenge arrives with no password configured
 // - ErrAuthMaxRetry when the peer keeps challenging past maxAuthAttempts
-// - ErrAnsweredAfterCancel when a 2xx answers the INVITE after ctx has ended, with the dialog established
+// - ctx's error when ctx ends before a final response and the INVITE then ends without a 2xx
+// - *ErrAnsweredAfterCancel, with ctx's error in Err, when a 2xx answers the INVITE after ctx has ended, with the dialog established
 // - any internal in case waiting answer failed for different reasons
 //
-// The CANCEL is sent once ctx has ended, so it runs on a context that does not
-// end with ctx, bounded by the CANCEL transaction's Timer F and by the 64*T1
-// wait for the INVITE's final that follows it. To have the CANCEL's wait end
-// with a context of the caller's, wait with WaitAnswerLeavePending and send
-// the CANCEL with Cancel.
-func (s *DialogClientSession) WaitAnswer(ctx context.Context, opts AnswerOptions) error {
-	return s.WaitAnswerWithCancelContext(ctx, context.WithoutCancel(ctx), opts)
-}
-
-// WaitAnswerWithCancelContext is WaitAnswer, sending the CANCEL that ctx's end
-// makes on cancelCtx, which outlives ctx, such as the context of the owner of
-// the call the INVITE attempts. The CANCEL waits for its answer within its
-// transaction's Timer F, and then for the INVITE's final within 64*T1 (RFC 3261
-// section 9.1). When cancelCtx ends first, the wait ends: the INVITE
-// transaction is terminated, and the error returned wraps both ctx's error and
-// cancelCtx's cause.
+// When ctx ends before a final response, WaitAnswer withdraws the INVITE as
+// Cancel does and returns only once that is over. It is for a caller that has
+// no context outliving ctx to withdraw on, and it is the one place where the
+// withdrawal runs detached from its caller: no context ends it, and the timers
+// of RFC 3261 alone bound it, the INVITE transaction's Timer B while no
+// provisional has come, the CANCEL transaction's Timer F, then 64*T1 for the
+// INVITE's final (section 9.1). A non-2xx final that comes before a
+// provisional let a CANCEL be sent, and an INVITE or CANCEL transaction that
+// ends under those waits, are reported with an error that is not ctx's.
 //
-// Deprecated: Use WaitAnswerLeavePending to wait on ctx and, when its error
-// wraps ErrInvitePending, Cancel to withdraw the INVITE on the context that
-// outlives ctx, so each function takes the one context its work ends with.
-func (s *DialogClientSession) WaitAnswerWithCancelContext(ctx, cancelCtx context.Context, opts AnswerOptions) error {
+// A caller that has a context outliving ctx, such as the context of the owner
+// of the call the INVITE attempts, waits with WaitAnswerLeavePending and
+// withdraws the INVITE with Cancel on that context instead, so the owner can
+// end the withdrawal too.
+//
+// When ctx was ended with the cause WaitAnswerForceCancelErr, WaitAnswer sends
+// no CANCEL: it terminates the INVITE transaction and returns ctx's error.
+func (s *DialogClientSession) WaitAnswer(ctx context.Context, opts AnswerOptions) error {
 	err := s.WaitAnswerLeavePending(ctx, opts)
 	if !errors.Is(err, ErrInvitePending) {
 		return err
@@ -313,7 +311,11 @@ func (s *DialogClientSession) WaitAnswerWithCancelContext(ctx, cancelCtx context
 		return ctx.Err()
 	}
 
-	err = s.Cancel(cancelCtx)
+	// ctx has ended and the CANCEL is still to be sent and answered, so the
+	// withdrawal cannot run on ctx, and this function has no other context to
+	// run it on. Only this call is detached; every wait under it ends on a
+	// timer of its own, see Cancel.
+	err = s.Cancel(context.WithoutCancel(ctx))
 	var answered *ErrAnsweredAfterCancel
 	var refused *ErrDialogResponse
 	switch {
@@ -324,10 +326,6 @@ func (s *DialogClientSession) WaitAnswerWithCancelContext(ctx, cancelCtx context
 		return &ErrAnsweredAfterCancel{Res: answered.Res, Err: ctx.Err()}
 	case errors.As(err, &refused):
 		return fmt.Errorf("non provisional response received during CANCEL. resp=%s", refused.Res.String())
-	case cancelCtx.Err() != nil && errors.Is(err, context.Cause(cancelCtx)):
-		// Both ends are reported: of the wait for the answer, and of the
-		// CANCEL's wait.
-		return errors.Join(ctx.Err(), err)
 	}
 	return err
 }
