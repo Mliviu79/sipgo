@@ -506,13 +506,14 @@ func errCancelCut(ctx context.Context) error {
 	return fmt.Errorf("CANCEL: %w", context.Cause(ctx))
 }
 
-// inviteFinal returns the final response that answered the INVITE as it was
-// last sent, nil while that INVITE is pending. A challenge that was answered
-// by sending the INVITE again stays in InviteResponse until the next response:
-// it is the final of the INVITE before, which its CSeq tells apart.
-func (s *DialogClientSession) inviteFinal() *sip.Response {
+// currentResponse returns the response last read when it is to the INVITE as
+// it was last sent, nil when none has come for that INVITE. A challenge that
+// was answered by sending the INVITE again stays in InviteResponse until the
+// next response: it is the final of the INVITE before, which its CSeq tells
+// apart.
+func (s *DialogClientSession) currentResponse() *sip.Response {
 	r := s.InviteResponse
-	if r == nil || r.IsProvisional() {
+	if r == nil {
 		return nil
 	}
 	if cseq := r.CSeq(); cseq != nil && cseq.SeqNo != s.InviteRequest.CSeq().SeqNo {
@@ -521,12 +522,25 @@ func (s *DialogClientSession) inviteFinal() *sip.Response {
 	return r
 }
 
+// inviteFinal returns the final response that answered the INVITE as it was
+// last sent, nil while that INVITE is pending.
+func (s *DialogClientSession) inviteFinal() *sip.Response {
+	r := s.currentResponse()
+	if r == nil || r.IsProvisional() {
+		return nil
+	}
+	return r
+}
+
 // Cancel withdraws the pending INVITE as RFC 3261 section 9.1 has it: it
 // waits for a provisional response when none has come, sends the CANCEL and
 // waits for its answer within Timer F, then waits for the INVITE's final
-// response within 64*T1. It is for the INVITE WaitAnswerLeavePending left
-// pending, and takes the context of whoever owns the call the INVITE
-// attempts, which outlives the wait for the answer.
+// response within 64*T1. The provisional is one to the INVITE as it was last
+// sent: a challenge that was answered by sending the INVITE again is a
+// response to the INVITE before, and does not let the CANCEL be sent. Cancel
+// is for the INVITE WaitAnswerLeavePending left pending, and takes the
+// context of whoever owns the call the INVITE attempts, which outlives the
+// wait for the answer.
 //
 // It returns:
 //   - nil when the INVITE ended without a 2xx after the CANCEL: on its final
@@ -575,7 +589,11 @@ func (s *DialogClientSession) cancelPending(ctx context.Context) error {
 	// Cancel can only be sent when provisional is received
 	// https://datatracker.ietf.org/doc/html/rfc3261#section-9.1
 	// The wait for it ends with the INVITE transaction (Timer B).
-	if s.InviteResponse == nil {
+	// No final answered the INVITE as it was last sent, so a response to it
+	// is a provisional. A response to the INVITE before, the challenge that
+	// had it sent again, does not say the server has received the INVITE the
+	// CANCEL is of, and a CANCEL could reach the server ahead of it.
+	if s.currentResponse() == nil {
 		select {
 		case r := <-tx.Responses():
 			s.InviteResponse = r

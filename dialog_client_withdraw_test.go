@@ -453,43 +453,193 @@ func TestDialogClientCancelAfterFinal(t *testing.T) {
 	})
 }
 
-// TestDialogClientCancelAfterChallenge has the wait's context end while the
-// INVITE that was sent again with credentials is pending. The challenge is
-// the last response read, and it is the final of the INVITE before: Cancel
-// withdraws the pending one with a CANCEL of its transaction instead of
-// taking it as answered.
+// challengeAnswer holds the credentials a test answers a digest challenge
+// with.
+var challengeAnswer = AnswerOptions{Username: "user", Password: "secret"}
+
+// challenge has the peer answer the INVITE the dialog sent with a digest
+// challenge, and returns the challenge and the INVITE the dialog then sends
+// again with credentials, on a new transaction. The dialog's wait for the
+// answer is running with challengeAnswer.
+func (p *scriptedPeer) challenge(t *testing.T) (*sip.Response, sentRequest) {
+	t.Helper()
+	first := p.next(t, sip.INVITE)
+	challenge := sip.NewResponseFromRequest(first.req, sip.StatusUnauthorized, "Unauthorized", nil)
+	challenge.AppendHeader(sip.NewHeader("WWW-Authenticate", `Digest realm="test", nonce="662d65a084b88c6d2a745a9de086fa91", algorithm=MD5`))
+	go first.w.Receive(challenge)
+	resent := p.next(t, sip.INVITE)
+	require.NotNil(t, resent.req.GetHeader("Authorization"), "the INVITE is sent again with credentials")
+	return challenge, resent
+}
+
+// leaveChallengedPending is leavePending for an INVITE the peer challenges:
+// the dialog sends it again with credentials, and the wait's context ends
+// while that INVITE is pending. It returns the INVITE sent again. With ringing
+// the peer answers it with a 180 first, which the wait reads before its
+// context ends; without it the challenge is the last response read, and it is
+// the final of the INVITE before.
+func leaveChallengedPending(t *testing.T, p *scriptedPeer, d *DialogClientSession, ringing bool) sentRequest {
+	t.Helper()
+	ctx, giveUp := context.WithCancelCause(t.Context())
+	defer giveUp(nil)
+	waited := make(chan error, 1)
+	go func() { waited <- d.WaitAnswerLeavePending(ctx, challengeAnswer) }()
+
+	challenge, resent := p.challenge(t)
+	if ringing {
+		p.answer(resent, sip.StatusRinging, "Ringing")
+	}
+	giveUp(errGaveUp)
+	require.ErrorIs(t, <-waited, ErrInvitePending)
+	if !ringing {
+		require.Same(t, challenge, d.InviteResponse, "the challenge is the last response read")
+	}
+	return resent
+}
+
+// TestDialogClientCancelAfterChallenge has the caller give up while the
+// INVITE that was sent again with credentials is pending. The challenge is a
+// response to the INVITE before, on a transaction that has ended, so it
+// neither answers the pending INVITE nor lets its CANCEL be sent: Cancel
+// waits for a provisional to the INVITE sent again (RFC 3261 section 9.1),
+// and that wait ends as it does for an INVITE that has had no response.
 func TestDialogClientCancelAfterChallenge(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		p, d := newScriptedDialog(t)
-		ctx, giveUp := context.WithCancelCause(t.Context())
-		defer giveUp(nil)
-		waited := make(chan error, 1)
-		go func() {
-			waited <- d.WaitAnswerLeavePending(ctx, AnswerOptions{Username: "user", Password: "secret"})
-		}()
-
-		first := p.next(t, sip.INVITE)
-		challenge := sip.NewResponseFromRequest(first.req, sip.StatusUnauthorized, "Unauthorized", nil)
-		challenge.AppendHeader(sip.NewHeader("WWW-Authenticate", `Digest realm="test", nonce="662d65a084b88c6d2a745a9de086fa91", algorithm=MD5`))
-		go first.w.Receive(challenge)
-		second := p.next(t, sip.INVITE)
-		require.NotNil(t, second.req.GetHeader("Authorization"), "the INVITE is sent again with credentials")
-
-		giveUp(errGaveUp)
-		require.ErrorIs(t, <-waited, ErrInvitePending)
-		assert.Same(t, challenge, d.InviteResponse)
-
-		cancelled := cancelling(t.Context(), d)
+	// withdrawn has the peer send a provisional to the INVITE sent again,
+	// answer the CANCEL that only then goes out, and end the INVITE with a
+	// 487.
+	withdrawn := func(t *testing.T, p *scriptedPeer, resent sentRequest) {
+		t.Helper()
+		p.sentNothing(t)
+		p.answer(resent, sip.StatusTrying, "Trying")
 		cancelReq := p.next(t, sip.CANCEL)
-		wantBranch, _ := second.req.Via().Params.Get("branch")
+		wantBranch, _ := resent.req.Via().Params.Get("branch")
 		gotBranch, _ := cancelReq.req.Via().Params.Get("branch")
 		assert.Equal(t, wantBranch, gotBranch, "the CANCEL is of the pending INVITE's transaction")
 		p.answer(cancelReq, sip.StatusOK, "OK")
-		p.answer(second, sip.StatusRequestTerminated, "Request Terminated")
+		p.answer(resent, sip.StatusRequestTerminated, "Request Terminated")
+	}
 
-		require.NoError(t, <-cancelled)
-		assert.Equal(t, sip.StatusRequestTerminated, d.InviteResponse.StatusCode)
-		assert.True(t, inviteEnded(d), "the INVITE transaction is terminated")
+	t.Run("NoCancelBeforeAProvisional", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			p, d := newScriptedDialog(t)
+			resent := leaveChallengedPending(t, p, d, false)
+
+			cancelled := cancelling(t.Context(), d)
+			withdrawn(t, p, resent)
+
+			require.NoError(t, <-cancelled)
+			assert.Equal(t, sip.StatusRequestTerminated, d.InviteResponse.StatusCode)
+			assert.True(t, inviteEnded(d), "the INVITE transaction is terminated")
+			p.sentNothing(t)
+		})
+	})
+
+	t.Run("AfterAProvisional", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			p, d := newScriptedDialog(t)
+			resent := leaveChallengedPending(t, p, d, true)
+
+			cancelled := cancelling(t.Context(), d)
+			cancelReq := p.next(t, sip.CANCEL)
+			p.answer(cancelReq, sip.StatusOK, "OK")
+			p.answer(resent, sip.StatusRequestTerminated, "Request Terminated")
+
+			require.NoError(t, <-cancelled)
+			assert.Equal(t, sip.StatusRequestTerminated, d.InviteResponse.StatusCode)
+			assert.True(t, inviteEnded(d), "the INVITE transaction is terminated")
+			p.sentNothing(t)
+		})
+	})
+
+	t.Run("AnsweredBeforeAProvisional", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			p, d := newScriptedDialog(t)
+			resent := leaveChallengedPending(t, p, d, false)
+
+			cancelled := cancelling(t.Context(), d)
+			p.sentNothing(t)
+			final := p.answer(resent, sip.StatusOK, "OK")
+
+			var answer *ErrAnsweredAfterCancel
+			require.ErrorAs(t, <-cancelled, &answer)
+			assert.Same(t, final, answer.Res)
+			require.NoError(t, answer.Err)
+			assert.Equal(t, sip.DialogStateEstablished, d.LoadState())
+			assert.Same(t, final, d.InviteResponse)
+			assert.False(t, inviteEnded(d), "the INVITE transaction is kept for the ACK")
+			p.sentNothing(t)
+		})
+	})
+
+	t.Run("RefusedBeforeAProvisional", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			p, d := newScriptedDialog(t)
+			resent := leaveChallengedPending(t, p, d, false)
+
+			cancelled := cancelling(t.Context(), d)
+			p.sentNothing(t)
+			final := p.answer(resent, sip.StatusBusyHere, "Busy Here")
+
+			var refusal *ErrDialogResponse
+			require.ErrorAs(t, <-cancelled, &refusal)
+			assert.Same(t, final, refusal.Res)
+			assert.Same(t, final, d.InviteResponse)
+			assert.True(t, inviteEnded(d), "the INVITE transaction is terminated")
+			p.sentNothing(t)
+		})
+	})
+
+	t.Run("TheInviteIsNotAnswered", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			start := time.Now()
+			p, d := newScriptedDialog(t)
+			leaveChallengedPending(t, p, d, false)
+
+			err := <-cancelling(t.Context(), d)
+			require.ErrorIs(t, err, sip.ErrTransactionTimeout)
+			assert.Equal(t, sip.Timer_B, time.Since(start), "the wait ends on Timer B of the INVITE sent again")
+			assert.True(t, inviteEnded(d), "the INVITE transaction is terminated")
+			p.sentNothing(t)
+		})
+	})
+
+	t.Run("TheContextEnds", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			p, d := newScriptedDialog(t)
+			leaveChallengedPending(t, p, d, false)
+			ctx, stop := context.WithCancelCause(t.Context())
+			defer stop(nil)
+
+			start := time.Now()
+			cancelled := cancelling(ctx, d)
+			p.sentNothing(t)
+			stop(errOwnerStopped)
+
+			err := <-cancelled
+			require.ErrorIs(t, err, errOwnerStopped)
+			assert.Zero(t, time.Since(start), "Cancel ends with its context, ahead of Timer B")
+			assert.True(t, inviteEnded(d), "the INVITE transaction is terminated")
+			p.sentNothing(t)
+		})
+	})
+
+	t.Run("WaitAnswerWithdraws", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			p, d := newScriptedDialog(t)
+			ctx, giveUp := context.WithCancelCause(t.Context())
+			defer giveUp(nil)
+			answered := make(chan error, 1)
+			go func() { answered <- d.WaitAnswer(ctx, challengeAnswer) }()
+			_, resent := p.challenge(t)
+
+			giveUp(errGaveUp)
+			withdrawn(t, p, resent)
+
+			require.ErrorIs(t, <-answered, context.Canceled)
+			assert.Equal(t, sip.StatusRequestTerminated, d.InviteResponse.StatusCode)
+			assert.True(t, inviteEnded(d), "the INVITE transaction is terminated")
+			p.sentNothing(t)
+		})
 	})
 }
 
