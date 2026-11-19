@@ -129,7 +129,7 @@ func (s *DialogClientSession) buildReq(req *sip.Request) {
 
 	// Check record route header
 	if s.InviteResponse != nil {
-		hdrs := s.InviteResponse.GetHeaders("record-route")
+		hdrs := routeSetRecordRoutes(s.InviteResponse)
 		// More on
 		// https://datatracker.ietf.org/doc/html/rfc3261#section-16.12.1.1
 		if len(hdrs) > 0 {
@@ -157,6 +157,19 @@ func (s *DialogClientSession) buildReq(req *sip.Request) {
 	s.lastCSeqNo.Store(cseq.SeqNo)
 	// Make sure transport matches original invite
 	req.SetTransport(s.InviteRequest.Transport())
+}
+
+// routeSetRecordRoutes returns the Record-Route header fields of res, the
+// last response to the dialog's INVITE, that the dialog's route set is made
+// of. A final response that is not a 2xx gives none: it establishes no dialog
+// (RFC 3261 section 12.1) and ends the early ones (section 13.2.2.3), so a
+// request built after it, as the INVITE sent again to answer a 401 or 407 is
+// (sections 8.1.3.5 and 22.2), is outside a dialog and keeps the route it has.
+func routeSetRecordRoutes(res *sip.Response) []sip.Header {
+	if !res.IsProvisional() && !res.IsSuccess() {
+		return nil
+	}
+	return res.GetHeaders("record-route")
 }
 
 // Close must be always called in order to cleanup some internal resources

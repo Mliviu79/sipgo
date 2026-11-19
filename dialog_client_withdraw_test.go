@@ -39,10 +39,11 @@ type scriptedPeer struct {
 	sent chan sentRequest
 }
 
-// newScriptedDialog sends an INVITE to a scriptedPeer and returns both. It
-// ends the INVITE transaction with the test, so a response the dialog left
-// unread does not hold its delivery past the bubble.
-func newScriptedDialog(t *testing.T) (*scriptedPeer, *DialogClientSession) {
+// newScriptedDialog sends an INVITE to a scriptedPeer, with the given headers
+// added to it, and returns both. It ends the INVITE transaction with the
+// test, so a response the dialog left unread does not hold its delivery past
+// the bubble.
+func newScriptedDialog(t *testing.T, headers ...sip.Header) (*scriptedPeer, *DialogClientSession) {
 	t.Helper()
 	p := &scriptedPeer{sent: make(chan sentRequest, 16)}
 	client := testClientResponder(t, func(req *sip.Request, w *siptest.ClientTxResponder) {
@@ -52,7 +53,7 @@ func newScriptedDialog(t *testing.T) (*scriptedPeer, *DialogClientSession) {
 		Client:     client,
 		ContactHDR: sip.ContactHeader{Address: sip.Uri{User: "uac", Host: "127.0.0.1", Port: 5060}},
 	}
-	d, err := dua.Invite(t.Context(), sip.Uri{User: "uas", Host: "localhost"}, nil)
+	d, err := dua.Invite(t.Context(), sip.Uri{User: "uas", Host: "localhost"}, nil, headers...)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		d.inviteTx.Terminate()
@@ -88,20 +89,32 @@ func (p *scriptedPeer) sentNothing(t *testing.T) {
 	}
 }
 
-// answer has the transaction of r receive a response of the given status and
-// returns it once every goroutine has settled. A response to the INVITE
-// carries the peer's To tag and Contact, so its 2xx sets up the dialog. The
-// transaction hands the response to whoever waits on it, so the delivery runs
-// on a goroutine of its own, which ends when the response is read or the
-// transaction ends.
-func (p *scriptedPeer) answer(r sentRequest, code int, reason string) *sip.Response {
+// response returns the response of the given status the peer has for r,
+// which the test sends with deliver. A response to the INVITE carries the
+// peer's To tag and Contact, so its 2xx sets up the dialog.
+func (*scriptedPeer) response(r sentRequest, code int, reason string) *sip.Response {
 	res := sip.NewResponseFromRequest(r.req, code, reason, nil)
 	if r.req.IsInvite() {
 		res.To().Params.Add("tag", "uas-tag")
 		res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "uas", Host: "127.0.0.1", Port: 5090}})
 	}
+	return res
+}
+
+// deliver has the transaction of r receive res and returns once every
+// goroutine has settled. The transaction hands the response to whoever waits
+// on it, so the delivery runs on a goroutine of its own, which ends when the
+// response is read or the transaction ends.
+func (*scriptedPeer) deliver(r sentRequest, res *sip.Response) {
 	go r.w.Receive(res)
 	synctest.Wait()
+}
+
+// answer has the transaction of r receive a response of the given status, as
+// response builds it, and returns it once every goroutine has settled.
+func (p *scriptedPeer) answer(r sentRequest, code int, reason string) *sip.Response {
+	res := p.response(r, code, reason)
+	p.deliver(r, res)
 	return res
 }
 
@@ -457,6 +470,14 @@ func TestDialogClientCancelAfterFinal(t *testing.T) {
 // with.
 var challengeAnswer = AnswerOptions{Username: "user", Password: "secret"}
 
+// challengeTo returns the digest challenge the peer has for the INVITE r,
+// which the test sends with deliver.
+func (*scriptedPeer) challengeTo(r sentRequest) *sip.Response {
+	challenge := sip.NewResponseFromRequest(r.req, sip.StatusUnauthorized, "Unauthorized", nil)
+	challenge.AppendHeader(sip.NewHeader("WWW-Authenticate", `Digest realm="test", nonce="662d65a084b88c6d2a745a9de086fa91", algorithm=MD5`))
+	return challenge
+}
+
 // challenge has the peer answer the INVITE the dialog sent with a digest
 // challenge, and returns the challenge and the INVITE the dialog then sends
 // again with credentials, on a new transaction. The dialog's wait for the
@@ -464,8 +485,7 @@ var challengeAnswer = AnswerOptions{Username: "user", Password: "secret"}
 func (p *scriptedPeer) challenge(t *testing.T) (*sip.Response, sentRequest) {
 	t.Helper()
 	first := p.next(t, sip.INVITE)
-	challenge := sip.NewResponseFromRequest(first.req, sip.StatusUnauthorized, "Unauthorized", nil)
-	challenge.AppendHeader(sip.NewHeader("WWW-Authenticate", `Digest realm="test", nonce="662d65a084b88c6d2a745a9de086fa91", algorithm=MD5`))
+	challenge := p.challengeTo(first)
 	go first.w.Receive(challenge)
 	resent := p.next(t, sip.INVITE)
 	require.NotNil(t, resent.req.GetHeader("Authorization"), "the INVITE is sent again with credentials")
