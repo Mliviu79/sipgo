@@ -136,6 +136,17 @@ func (s *DialogClientSession) buildReq(req *sip.Request) {
 		cseq.SeqNo = s.InviteRequest.CSeq().SeqNo
 	}
 
+	// An ACK has the CSeq number of the INVITE it acknowledges (RFC 3261
+	// section 13.2.2.4), which the dialog's last number no longer is once a
+	// request was sent inside the dialog after that INVITE. The INVITE is the
+	// one this side last sent, a re-INVITE included.
+	if req.IsInvite() {
+		s.inviteCSeqNo.Store(cseq.SeqNo)
+	}
+	if req.IsAck() {
+		cseq.SeqNo = s.inviteCSeqNo.Load()
+	}
+
 	// Check record route header
 	// A CANCEL is not a request inside the dialog: its Request-URI, its Route
 	// header fields and where it is sent are those of the INVITE it cancels
@@ -229,6 +240,7 @@ func (d *DialogClientSession) Invite(ctx context.Context, options ...ClientReque
 
 	if err == nil {
 		d.lastCSeqNo.Store(inviteReq.CSeq().SeqNo)
+		d.inviteCSeqNo.Store(inviteReq.CSeq().SeqNo)
 	}
 
 	return err

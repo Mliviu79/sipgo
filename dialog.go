@@ -57,6 +57,10 @@ type Dialog struct {
 	// lastCSeqNo is set for every request within dialog except ACK CANCEL
 	lastCSeqNo   atomic.Uint32
 	remoteCSeqNo atomic.Uint32
+	// inviteCSeqNo is the CSeq number of the INVITE this side last sent in the
+	// dialog: the one that set it up, as it was last sent, or a re-INVITE. The
+	// ACK of that INVITE's 2xx carries it (RFC 3261 section 13.2.2.4).
+	inviteCSeqNo atomic.Uint32
 
 	// InviteResponse is last response received or sent. It is not thread safe!
 	// Use it only as read only and do not change values
@@ -154,6 +158,11 @@ func (d *Dialog) authorizedCopy(req *sip.Request, res *sip.Response) (*sip.Reque
 		return nil, err
 	}
 	retry.CSeq().SeqNo = d.lastCSeqNo.Add(1)
+	if retry.IsInvite() {
+		// The 2xx of a re-INVITE sent again answers this copy, so its ACK
+		// has this copy's number.
+		d.inviteCSeqNo.Store(retry.CSeq().SeqNo)
+	}
 	return retry, nil
 }
 
