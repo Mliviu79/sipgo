@@ -230,28 +230,41 @@ var (
 	// maxAuthAttempts. The credentials were presented and refused repeatedly, so
 	// no further retry can succeed.
 	ErrAuthMaxRetry = errors.New("auth max retries reached")
+
+	// ErrInvitePending is wrapped by the error WaitAnswerLeavePending returns
+	// when its context ends before the INVITE's final response: no CANCEL was
+	// sent and the INVITE transaction is still running. Cancel withdraws it.
+	ErrInvitePending = errors.New("INVITE is pending")
 )
 
-// ErrAnsweredAfterCancel is returned by WaitAnswer when the INVITE is answered
-// with a 2xx after the context it waited on has ended: the 2xx crossed our
-// CANCEL, or arrived before a provisional let a CANCEL be sent (RFC 3261
-// section 9.1). The dialog is established from Res, as for any 2xx WaitAnswer
-// returns, and its INVITE transaction is kept, so the caller acknowledges it
-// with Ack, as RFC 3261 section 13.2.2.4 requires for every 2xx, and ends it
-// with Bye.
+// ErrAnsweredAfterCancel is returned, as a pointer, when the INVITE is answered
+// with a 2xx although the caller gave it up: by Cancel, and by WaitAnswer after
+// the context it waited on has ended. The 2xx crossed our CANCEL, or arrived
+// before a provisional let a CANCEL be sent (RFC 3261 section 9.1). The dialog
+// is established from Res, as for any 2xx WaitAnswer returns, and its INVITE
+// transaction is kept, so the caller acknowledges it with Ack, as RFC 3261
+// section 13.2.2.4 requires for every 2xx, and ends it with Bye.
 type ErrAnsweredAfterCancel struct {
 	// Res is the 2xx that answered the INVITE.
 	Res *sip.Response
-	// Err is the error of the context that made the caller give up.
+	// Err is the error of the context that made the caller give up, which
+	// WaitAnswer and WaitAnswerWithCancelContext set. It is nil when Cancel
+	// returns the error: Cancel is not given that context.
 	Err error
 }
 
+// Error names the 2xx, followed by Err when there is one.
 func (e *ErrAnsweredAfterCancel) Error() string {
-	return fmt.Sprintf("INVITE answered %d %s after it was cancelled: %v", e.Res.StatusCode, e.Res.Reason, e.Err)
+	answered := fmt.Sprintf("INVITE answered %d %s after it was cancelled", e.Res.StatusCode, e.Res.Reason)
+	if e.Err == nil {
+		return answered
+	}
+	return answered + ": " + e.Err.Error()
 }
 
 // Unwrap returns the context's error, so a caller that reads only that error
-// sees it as it would for a cancel that was not answered.
+// sees it as it would for a cancel that was not answered. It returns nil for
+// an error Cancel returned.
 func (e *ErrAnsweredAfterCancel) Unwrap() error { return e.Err }
 
 // maxAuthAttempts caps how many digest challenges are answered on one INVITE.
@@ -271,8 +284,9 @@ const maxAuthAttempts = 2
 //
 // The CANCEL is sent once ctx has ended, so it runs on a context that does not
 // end with ctx, bounded by the CANCEL transaction's Timer F and by the 64*T1
-// wait for the INVITE's final that follows it. Use WaitAnswerWithCancelContext
-// to have the CANCEL's wait end with a context of the caller's.
+// wait for the INVITE's final that follows it. To have the CANCEL's wait end
+// with a context of the caller's, wait with WaitAnswerLeavePending and send
+// the CANCEL with Cancel.
 func (s *DialogClientSession) WaitAnswer(ctx context.Context, opts AnswerOptions) error {
 	return s.WaitAnswerWithCancelContext(ctx, context.WithoutCancel(ctx), opts)
 }
@@ -284,7 +298,59 @@ func (s *DialogClientSession) WaitAnswer(ctx context.Context, opts AnswerOptions
 // section 9.1). When cancelCtx ends first, the wait ends: the INVITE
 // transaction is terminated, and the error returned wraps both ctx's error and
 // cancelCtx's cause.
+//
+// Deprecated: Use WaitAnswerLeavePending to wait on ctx and, when its error
+// wraps ErrInvitePending, Cancel to withdraw the INVITE on the context that
+// outlives ctx, so each function takes the one context its work ends with.
 func (s *DialogClientSession) WaitAnswerWithCancelContext(ctx, cancelCtx context.Context, opts AnswerOptions) error {
+	err := s.WaitAnswerLeavePending(ctx, opts)
+	if !errors.Is(err, ErrInvitePending) {
+		return err
+	}
+	if context.Cause(ctx) == WaitAnswerForceCancelErr {
+		// In case caller wants to force cancelation exit.
+		s.inviteTx.Terminate()
+		return ctx.Err()
+	}
+
+	err = s.Cancel(cancelCtx)
+	var answered *ErrAnsweredAfterCancel
+	var refused *ErrDialogResponse
+	switch {
+	case err == nil:
+		// The INVITE ended without a 2xx: the end of the wait is the result.
+		return ctx.Err()
+	case errors.As(err, &answered):
+		return &ErrAnsweredAfterCancel{Res: answered.Res, Err: ctx.Err()}
+	case errors.As(err, &refused):
+		return fmt.Errorf("non provisional response received during CANCEL. resp=%s", refused.Res.String())
+	case cancelCtx.Err() != nil && errors.Is(err, context.Cause(cancelCtx)):
+		// Both ends are reported: of the wait for the answer, and of the
+		// CANCEL's wait.
+		return errors.Join(ctx.Err(), err)
+	}
+	return err
+}
+
+// WaitAnswerLeavePending waits for the INVITE's answer as WaitAnswer does,
+// with the same calls of OnResponse, the same answers to digest challenges
+// and the same results, and differs only in what the end of ctx does: it
+// sends no CANCEL and leaves the INVITE transaction running. When ctx ends
+// before a final response it returns an error that wraps ErrInvitePending and
+// context.Cause(ctx). The INVITE is then the caller's to end: Cancel
+// withdraws it, on a context that outlives ctx, such as the context of the
+// owner of the call the INVITE attempts.
+//
+// It returns:
+//   - *ErrDialogResponse for a non-2xx final response
+//   - ErrAuthMissingCreds when a real challenge arrives with no password
+//     configured
+//   - ErrAuthMaxRetry when the peer keeps challenging past maxAuthAttempts
+//   - an error wrapping ErrInvitePending and context.Cause(ctx) when ctx ends
+//     before a final response
+//   - the error of OnResponse, of the INVITE transaction when it ends under
+//     the wait, or of sending the INVITE again to answer a challenge
+func (s *DialogClientSession) WaitAnswerLeavePending(ctx context.Context, opts AnswerOptions) error {
 	tx, inviteRequest := s.inviteTx, s.InviteRequest
 	var r *sip.Response
 	var err error
@@ -301,18 +367,10 @@ func (s *DialogClientSession) WaitAnswerWithCancelContext(ctx, cancelCtx context
 
 			// just pass
 		case <-ctx.Done():
-			// Send cancel
-			// https://datatracker.ietf.org/doc/html/rfc3261#section-9.1
-			// Cancel can only be sent when provisional is received
-			// We will wait until transaction timeous out (TimerB)
-			err := s.inviteCancel(ctx, cancelCtx, tx)
-			// A 2xx answered the INVITE regardless: its transaction is kept, so
-			// its retransmissions reach the ACK the caller sends.
-			var answered *ErrAnsweredAfterCancel
-			if !errors.As(err, &answered) {
-				tx.Terminate()
-			}
-			return err
+			// The INVITE stays pending and its transaction running: ending
+			// it takes a CANCEL, whose wait must outlive this context
+			// (RFC 3261 section 9.1), see Cancel.
+			return fmt.Errorf("%w: %w", ErrInvitePending, context.Cause(ctx))
 		case <-tx.Done():
 			// tx.Err() can be empty
 			return errors.Join(fmt.Errorf("transaction terminated"), tx.Err())
@@ -435,46 +493,106 @@ func (s *DialogClientSession) establish(tx sip.ClientTransaction, r *sip.Respons
 	return nil
 }
 
-// answeredAfterCancel establishes the dialog from r, a 2xx read after ctx
-// ended, and returns the ErrAnsweredAfterCancel that hands it to the caller.
-func (s *DialogClientSession) answeredAfterCancel(ctx context.Context, tx sip.ClientTransaction, r *sip.Response) error {
+// answeredAfterCancel establishes the dialog from r, the 2xx that answered an
+// INVITE its caller gave up, and returns the ErrAnsweredAfterCancel that hands
+// it to the caller.
+func (s *DialogClientSession) answeredAfterCancel(tx sip.ClientTransaction, r *sip.Response) error {
 	if err := s.establish(tx, r); err != nil {
 		return err
 	}
-	return &ErrAnsweredAfterCancel{Res: r, Err: ctx.Err()}
+	return &ErrAnsweredAfterCancel{Res: r}
 }
 
-// errCancelWaitCut joins ctx's error, the end of the wait for the answer, with
-// cancelCtx's cause, the end of the CANCEL's wait.
-func errCancelWaitCut(ctx, cancelCtx context.Context) error {
-	return errors.Join(ctx.Err(), fmt.Errorf("CANCEL: %w", context.Cause(cancelCtx)))
+// errCancelCut is the error of a Cancel that ctx ended before the INVITE did.
+func errCancelCut(ctx context.Context) error {
+	return fmt.Errorf("CANCEL: %w", context.Cause(ctx))
 }
 
-// inviteCancel CANCELs the INVITE of tx, whose wait for an answer ctx ended,
-// on cancelCtx, see WaitAnswerWithCancelContext.
-func (s *DialogClientSession) inviteCancel(ctx, cancelCtx context.Context, tx sip.ClientTransaction) error {
-	if err := context.Cause(ctx); err == WaitAnswerForceCancelErr {
-		// In case caller wants to force cancelation exit.
-		return ctx.Err()
+// inviteFinal returns the final response that answered the INVITE as it was
+// last sent, nil while that INVITE is pending. A challenge that was answered
+// by sending the INVITE again stays in InviteResponse until the next response:
+// it is the final of the INVITE before, which its CSeq tells apart.
+func (s *DialogClientSession) inviteFinal() *sip.Response {
+	r := s.InviteResponse
+	if r == nil || r.IsProvisional() {
+		return nil
+	}
+	if cseq := r.CSeq(); cseq != nil && cseq.SeqNo != s.InviteRequest.CSeq().SeqNo {
+		return nil
+	}
+	return r
+}
+
+// Cancel withdraws the pending INVITE as RFC 3261 section 9.1 has it: it
+// waits for a provisional response when none has come, sends the CANCEL and
+// waits for its answer within Timer F, then waits for the INVITE's final
+// response within 64*T1. It is for the INVITE WaitAnswerLeavePending left
+// pending, and takes the context of whoever owns the call the INVITE
+// attempts, which outlives the wait for the answer.
+//
+// It returns:
+//   - nil when the INVITE ended without a 2xx after the CANCEL: on its final
+//     response, which InviteResponse then holds, or with none within 64*T1,
+//     when the INVITE is taken as cancelled
+//   - *ErrAnsweredAfterCancel, with a nil Err, when a 2xx answered the INVITE
+//     regardless, before a provisional let a CANCEL be sent or crossing the
+//     CANCEL: the dialog is established and the INVITE transaction is kept, so
+//     the caller sends Ack and then Bye
+//   - *ErrDialogResponse when a non-2xx final response answered the INVITE
+//     before a provisional let a CANCEL be sent: the peer refused the INVITE
+//     and nothing was withdrawn
+//   - an error wrapping context.Cause(ctx) when ctx ends first
+//   - the error the INVITE transaction ended with when it ends under the
+//     wait, as on its timeout with no response, or the error of the CANCEL's
+//     own transaction, as when the CANCEL is not answered within Timer F
+//
+// An INVITE that already has its final response is not cancelled: Cancel
+// sends nothing and returns *ErrAnsweredAfterCancel for a 2xx and
+// *ErrDialogResponse for any other final. Unless it returns
+// *ErrAnsweredAfterCancel, Cancel terminates the INVITE transaction.
+func (s *DialogClientSession) Cancel(ctx context.Context) error {
+	err := s.cancelPending(ctx)
+	// A 2xx answered the INVITE regardless: its transaction is kept, so its
+	// retransmissions reach the ACK the caller sends.
+	var answered *ErrAnsweredAfterCancel
+	if !errors.As(err, &answered) {
+		s.inviteTx.Terminate()
+	}
+	return err
+}
+
+// cancelPending is Cancel, leaving the INVITE transaction as it is.
+func (s *DialogClientSession) cancelPending(ctx context.Context) error {
+	tx := s.inviteTx
+	if r := s.inviteFinal(); r != nil {
+		if r.IsSuccess() {
+			return s.answeredAfterCancel(tx, r)
+		}
+		return &ErrDialogResponse{Res: r}
+	}
+	if ctx.Err() != nil {
+		return errCancelCut(ctx)
 	}
 
-	var r *sip.Response
+	// Cancel can only be sent when provisional is received
+	// https://datatracker.ietf.org/doc/html/rfc3261#section-9.1
+	// The wait for it ends with the INVITE transaction (Timer B).
 	if s.InviteResponse == nil {
 		select {
-		case r = <-tx.Responses():
+		case r := <-tx.Responses():
 			s.InviteResponse = r
 			if r.IsSuccess() {
 				// Answered before a CANCEL could be sent: RFC 3261 section
 				// 9.1 sends none before a provisional, and a 2xx is the final.
-				return s.answeredAfterCancel(ctx, tx, r)
+				return s.answeredAfterCancel(tx, r)
 			}
 			if !r.IsProvisional() {
-				return fmt.Errorf("non provisional response received during CANCEL. resp=%s", r.String())
+				return &ErrDialogResponse{Res: r}
 			}
 		case <-tx.Done():
-			return errors.Join(fmt.Errorf("transaction terminated"), tx.Err())
-		case <-cancelCtx.Done():
-			return errCancelWaitCut(ctx, cancelCtx)
+			return errors.Join(errors.New("transaction terminated"), tx.Err())
+		case <-ctx.Done():
+			return errCancelCut(ctx)
 		}
 	}
 
@@ -482,13 +600,9 @@ func (s *DialogClientSession) inviteCancel(ctx, cancelCtx context.Context, tx si
 	// transactions complete independently (RFC 3261 section 9.1). A UAS whose
 	// 2xx crossed the CANCEL no longer matches it and answers it 481 (section
 	// 9.2), and that 2xx is still to be acknowledged.
-	cancelReq := newCancelRequest(s.InviteRequest)
-	// Cancel should grab same connection underhood
-	sendCtx, cancelSend := context.WithTimeout(cancelCtx, sip.Timer_F)
-	defer cancelSend()
-	if _, err := s.Do(sendCtx, cancelReq); err != nil {
-		if cancelCtx.Err() != nil {
-			return errCancelWaitCut(ctx, cancelCtx)
+	if err := s.sendCancel(ctx); err != nil {
+		if ctx.Err() != nil {
+			return errCancelCut(ctx)
 		}
 		return err
 	}
@@ -503,23 +617,33 @@ func (s *DialogClientSession) inviteCancel(ctx, cancelCtx context.Context, tx si
 	defer finalWait.Stop()
 	for {
 		select {
-		case r = <-tx.Responses():
+		case r := <-tx.Responses():
 			if r.IsProvisional() {
 				continue
 			}
 			s.InviteResponse = r
 			if r.IsSuccess() {
-				return s.answeredAfterCancel(ctx, tx, r)
+				return s.answeredAfterCancel(tx, r)
 			}
-			return ctx.Err()
+			return nil
 		case <-tx.Done():
-			return tx.Err()
+			return endedWithoutFinal(tx)
 		case <-finalWait.C:
-			return ctx.Err()
-		case <-cancelCtx.Done():
-			return errCancelWaitCut(ctx, cancelCtx)
+			return nil
+		case <-ctx.Done():
+			return errCancelCut(ctx)
 		}
 	}
+}
+
+// sendCancel sends the CANCEL of the INVITE and waits for its final answer
+// within ctx, bounded by Timer F.
+func (s *DialogClientSession) sendCancel(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, sip.Timer_F)
+	defer cancel()
+	// Cancel should grab same connection underhood
+	_, err := s.Do(ctx, newCancelRequest(s.InviteRequest))
+	return err
 }
 
 // Ack sends ack. Use WriteAck for more customizing
