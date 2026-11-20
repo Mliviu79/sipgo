@@ -1341,6 +1341,12 @@ func headerNameKey(name string) string {
 		return "accept-contact"
 	case "b":
 		return "referred-by"
+	case "d":
+		return "request-disposition"
+	case "j":
+		return "reject-contact"
+	case "y":
+		return "identity"
 	case "k":
 		return "supported"
 	case "o":
@@ -1396,6 +1402,17 @@ func compactHeaderName(full string) string {
 		return "a"
 	case "Referred-By":
 		return "b"
+	case "Request-Disposition":
+		// RFC 3841 section 12 registers d as the compact form.
+		return "d"
+	case "Reject-Contact":
+		// RFC 3841 section 12 registers j as the compact form.
+		return "j"
+	case "Identity":
+		// RFC 4474 section 14.1 reserved y and RFC 8224 section 13.1 keeps it.
+		// Identity-Info's n is not here: RFC 8224 section 13.1 removed it
+		// from the registry.
+		return "y"
 	case "Supported":
 		return "k"
 	case "Event":

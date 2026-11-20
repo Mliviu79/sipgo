@@ -17,9 +17,11 @@ var compactHeaderForms = []struct {
 	{compact: "a", full: "Accept-Contact"},
 	{compact: "b", full: "Referred-By"},
 	{compact: "c", full: "Content-Type"},
+	{compact: "d", full: "Request-Disposition"},
 	{compact: "e", full: "Content-Encoding"},
 	{compact: "f", full: "From"},
 	{compact: "i", full: "Call-ID"},
+	{compact: "j", full: "Reject-Contact"},
 	{compact: "k", full: "Supported"},
 	{compact: "l", full: "Content-Length"},
 	{compact: "m", full: "Contact"},
@@ -30,6 +32,7 @@ var compactHeaderForms = []struct {
 	{compact: "u", full: "Allow-Events"},
 	{compact: "v", full: "Via"},
 	{compact: "x", full: "Session-Expires"},
+	{compact: "y", full: "Identity"},
 }
 
 func TestCompactHeaderNameRoundTrip(t *testing.T) {
@@ -59,6 +62,9 @@ const compactReferRequest = "REFER sip:bob@example.com SIP/2.0\r\n" +
 	"e: identity\r\n" +
 	"u: refer\r\n" +
 	"x: 1800;refresher=uas\r\n" +
+	"d: proxy\r\n" +
+	"j: *;video\r\n" +
+	"y: ..rq3pjT1hoRwakEGjHCnWSwUnshd0;info=<https://cert.example.org/passport.cer>\r\n" +
 	"c: text/plain\r\n" +
 	"l: 0\r\n" +
 	"\r\n"
@@ -109,12 +115,14 @@ func TestParseCompactHeaderLookups(t *testing.T) {
 
 	t.Run("NamesKeptOnTheWire", func(t *testing.T) {
 		out := req.String()
-		for _, line := range []string{"r: <sip:carol@example.com>\r\n", "b: <sip:alice@example.com>\r\n", "o: refer\r\n", "u: refer\r\n", "x: 1800;refresher=uas\r\n"} {
+		for _, line := range []string{"r: <sip:carol@example.com>\r\n", "b: <sip:alice@example.com>\r\n", "o: refer\r\n", "u: refer\r\n", "x: 1800;refresher=uas\r\n", "d: proxy\r\n", "j: *;video\r\n"} {
 			assert.Contains(t, out, line)
 		}
 		assert.NotContains(t, out, "Refer-To")
 		assert.NotContains(t, out, "Referred-By")
 		assert.NotContains(t, out, "Session-Expires")
+		assert.NotContains(t, out, "Request-Disposition")
+		assert.NotContains(t, out, "Reject-Contact")
 	})
 }
 
@@ -130,6 +138,9 @@ func TestFullHeaderFoundByCompactName(t *testing.T) {
 		"Refer-To: <sip:carol@example.com>\r\n" +
 		"Referred-By: <sip:bob@example.com>\r\n" +
 		"Session-Expires: 1800;refresher=uac\r\n" +
+		"Request-Disposition: proxy\r\n" +
+		"Reject-Contact: *;video\r\n" +
+		"Identity: ..rq3pjT1hoRwakEGjHCnWSwUnshd0;info=<https://cert.example.org/passport.cer>\r\n" +
 		"Content-Length: 0\r\n" +
 		"\r\n"
 	msg, err := ParseMessage([]byte(raw))
@@ -137,7 +148,7 @@ func TestFullHeaderFoundByCompactName(t *testing.T) {
 	req, ok := msg.(*Request)
 	require.True(t, ok)
 
-	for _, name := range []string{"o", "O", "u", "r", "b", "v", "f", "t", "i", "l", "x", "X"} {
+	for _, name := range []string{"o", "O", "u", "r", "b", "v", "f", "t", "i", "l", "x", "X", "d", "D", "j", "J", "y", "Y"} {
 		assert.NotNil(t, req.GetHeader(name), "GetHeader(%q)", name)
 		assert.Len(t, req.GetHeaders(name), 1, "GetHeaders(%q)", name)
 	}
@@ -186,4 +197,17 @@ func TestCompactSerialisationWritesSessionExpiresAsX(t *testing.T) {
 	hs.AppendHeader(NewHeader("Min-SE", "90"))
 
 	assert.Equal(t, "x: 1800;refresher=uac\r\nMin-SE: 90\r\n", hs.String())
+}
+
+func TestCompactSerialisationWritesCallerPreferencesAndIdentity(t *testing.T) {
+	hs := new(headers)
+	hs.CompactHeaders = true
+	hs.AppendHeader(NewHeader("Request-Disposition", "proxy"))
+	hs.AppendHeader(NewHeader("Reject-Contact", "*;video"))
+	hs.AppendHeader(NewHeader("Identity", "..sig;info=<https://cert.example.org/passport.cer>"))
+	// Identity-Info lost its compact form n (RFC 8224 section 13.1), so it
+	// keeps its full name.
+	hs.AppendHeader(NewHeader("Identity-Info", "<https://cert.example.org/cert.cer>"))
+
+	assert.Equal(t, "d: proxy\r\nj: *;video\r\ny: ..sig;info=<https://cert.example.org/passport.cer>\r\nIdentity-Info: <https://cert.example.org/cert.cer>\r\n", hs.String())
 }
