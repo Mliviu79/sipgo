@@ -171,7 +171,7 @@ func (hs *headers) AppendHeader(header Header) {
 func (hs *headers) AppendHeaderAfter(header Header, name string) {
 	ind := -1
 	for i, h := range hs.headerOrder {
-		if h.Name() == name {
+		if sameHeaderName(h.Name(), name) {
 			ind = i
 		}
 	}
@@ -212,7 +212,7 @@ func (hs *headers) PrependHeader(headers ...Header) {
 // ReplaceHeader replaces first header with same name
 func (hs *headers) ReplaceHeader(header Header) {
 	for i, h := range hs.headerOrder {
-		if h.Name() == header.Name() {
+		if sameHeaderName(h.Name(), header.Name()) {
 			hs.headerOrder[i] = header
 			hs.setHeaderRef(header)
 			break
@@ -231,9 +231,9 @@ func (hs *headers) Headers() []Header {
 // Headers are pointers, always Clone them for change
 func (hs *headers) GetHeaders(name string) []Header {
 	var hds []Header
-	nameLower := HeaderToLower(name)
+	key := headerNameKey(name)
 	for _, h := range hs.headerOrder {
-		if HeaderToLower(h.Name()) == nameLower {
+		if headerNameKey(h.Name()) == key {
 			hds = append(hds, h)
 		}
 	}
@@ -244,14 +244,14 @@ func (hs *headers) GetHeaders(name string) []Header {
 // Use lower case to avoid allocs
 // Headers are pointers, always Clone them for change
 func (hs *headers) GetHeader(name string) Header {
-	name = HeaderToLower(name)
-	return hs.getHeader(name)
+	return hs.getHeader(headerNameKey(name))
 }
 
-// getHeader is direct access, name must be lowercase
-func (hs *headers) getHeader(nameLower string) Header {
+// getHeader is direct access, key must be a headerNameKey result: the
+// lowercase full name.
+func (hs *headers) getHeader(key string) Header {
 	for _, h := range hs.headerOrder {
-		if HeaderToLower(h.Name()) == nameLower {
+		if headerNameKey(h.Name()) == key {
 			return h
 		}
 	}
@@ -266,7 +266,7 @@ func (hs *headers) RemoveHeader(name string) (removed bool) {
 	// update order slice
 	foundIdx := -1
 	for idx, entry := range hs.headerOrder {
-		if entry.Name() == name {
+		if sameHeaderName(entry.Name(), name) {
 			foundIdx = idx
 			hs.headerOrder = append(hs.headerOrder[:idx], hs.headerOrder[idx+1:]...)
 			hs.unref(entry)
@@ -278,7 +278,7 @@ func (hs *headers) RemoveHeader(name string) (removed bool) {
 	// Update refs
 	if removed {
 		for _, entry := range hs.headerOrder[foundIdx:] {
-			if entry.Name() == name {
+			if sameHeaderName(entry.Name(), name) {
 				hs.setHeaderRef(entry)
 				break
 			}
@@ -303,7 +303,7 @@ func (hs *headers) CloneHeaders() []Header {
 func (hs *headers) CallID() *CallIDHeader {
 	if hs.callid == nil {
 		var h CallIDHeader
-		if parseHeaderLazy(hs, parseCallIdHeader, []string{"call-id", "i"}, &h) {
+		if parseHeaderLazy(hs, parseCallIdHeader, []string{"call-id"}, &h) {
 			hs.callid = &h
 		}
 	}
@@ -314,7 +314,7 @@ func (hs *headers) CallID() *CallIDHeader {
 func (hs *headers) Via() *ViaHeader {
 	if hs.via == nil {
 		h := &ViaHeader{}
-		if parseHeaderLazy(hs, parseViaHeader, []string{"via", "v"}, h) {
+		if parseHeaderLazy(hs, parseViaHeader, []string{"via"}, h) {
 			hs.via = h
 		}
 	}
@@ -325,7 +325,7 @@ func (hs *headers) Via() *ViaHeader {
 func (hs *headers) From() *FromHeader {
 	if hs.from == nil {
 		h := &FromHeader{}
-		if parseHeaderLazy(hs, parseFromHeader, []string{"from", "f"}, h) {
+		if parseHeaderLazy(hs, parseFromHeader, []string{"from"}, h) {
 			hs.from = h
 		}
 	}
@@ -336,7 +336,7 @@ func (hs *headers) From() *FromHeader {
 func (hs *headers) To() *ToHeader {
 	if hs.to == nil {
 		h := &ToHeader{}
-		if parseHeaderLazy(hs, parseToHeader, []string{"to", "t"}, h) {
+		if parseHeaderLazy(hs, parseToHeader, []string{"to"}, h) {
 			hs.to = h
 		}
 	}
@@ -369,7 +369,7 @@ func (hs *headers) MaxForwards() *MaxForwardsHeader {
 func (hs *headers) ContentLength() *ContentLengthHeader {
 	if hs.contentLength == nil {
 		var h ContentLengthHeader
-		if parseHeaderLazy(hs, parseContentLengthHeader, []string{"content-length", "l"}, &h) {
+		if parseHeaderLazy(hs, parseContentLengthHeader, []string{"content-length"}, &h) {
 			hs.contentLength = &h
 		}
 	}
@@ -381,7 +381,7 @@ func (hs *headers) ContentLength() *ContentLengthHeader {
 func (hs *headers) ContentType() *ContentTypeHeader {
 	if hs.contentType == nil {
 		var h ContentTypeHeader
-		if parseHeaderLazy(hs, parseContentTypeHeader, []string{"content-type", "c"}, &h) {
+		if parseHeaderLazy(hs, parseContentTypeHeader, []string{"content-type"}, &h) {
 			hs.contentType = &h
 		}
 	}
@@ -393,7 +393,7 @@ func (hs *headers) ContentType() *ContentTypeHeader {
 func (hs *headers) Contact() *ContactHeader {
 	if hs.contact == nil {
 		h := &ContactHeader{}
-		if parseHeaderLazy(hs, parseContactHeader, []string{"contact", "m"}, h) {
+		if parseHeaderLazy(hs, parseContactHeader, []string{"contact"}, h) {
 			hs.contact = h
 		}
 	}
@@ -1306,6 +1306,68 @@ func parseHeaderLazy[T any, HP headerPointerReceiver[T]](hs *headers, f func(hea
 		return true
 	}
 	return false
+}
+
+// headerNameKey returns the key two header names are compared by when case
+// does not matter: the lowercase name, with a compact form expanded to its full
+// name. RFC 3261 section 7.3.3 makes the two forms the same header, so a lookup
+// by either form finds a header received or created in the other.
+func headerNameKey(name string) string {
+	lower := HeaderToLower(name)
+	if len(lower) != 1 {
+		return lower
+	}
+	// Inverse of compactHeaderName.
+	switch lower {
+	case "v":
+		return "via"
+	case "f":
+		return "from"
+	case "t":
+		return "to"
+	case "i":
+		return "call-id"
+	case "c":
+		return "content-type"
+	case "l":
+		return "content-length"
+	case "m":
+		return "contact"
+	case "r":
+		return "refer-to"
+	case "e":
+		return "content-encoding"
+	case "a":
+		return "accept-contact"
+	case "b":
+		return "referred-by"
+	case "k":
+		return "supported"
+	case "o":
+		return "event"
+	case "s":
+		return "subject"
+	case "u":
+		return "allow-events"
+	default:
+		return lower
+	}
+}
+
+// sameHeaderName reports whether two header names name the same header where
+// the comparison is case-sensitive: equal as written, or one of them is a
+// compact form of the other.
+func sameHeaderName(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if len(a) != 1 && len(b) != 1 {
+		return false
+	}
+	// Only an expanded compact form makes two names differing as written the
+	// same; names that differ only in case stay different, as they were here.
+	keyA, keyB := headerNameKey(a), headerNameKey(b)
+	return keyA == keyB && (len(keyA) != len(a) || len(keyB) != len(b))
 }
 
 func compactHeaderName(full string) string {
