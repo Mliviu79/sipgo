@@ -760,7 +760,9 @@ func (s *DialogClientSession) WriteAck(ctx context.Context, ack *sip.Request) er
 	return nil
 }
 
-// Bye sends bye and terminates session. Use WriteBye if you want to customize bye request
+// Bye sends bye and terminates session. Use WriteBye if you want to customize
+// bye request. ctx bounds the wait for the BYE's answer, as WriteBye
+// describes.
 func (s *DialogClientSession) Bye(ctx context.Context) error {
 	if s.InviteResponse == nil {
 		return fmt.Errorf("bye: can not send as no invite response present")
@@ -774,6 +776,11 @@ func (s *DialogClientSession) Bye(ctx context.Context) error {
 // credentials answer is answered once, as Do does. The dialog ends as soon as
 // bye is passed to its client transaction (RFC 3261 section 15.1.1), whatever
 // the answer.
+//
+// ctx bounds the wait for the answer and is used as given. Ending the dialog
+// ends its context, so a ctx that is, or derives from, the dialog's context
+// ends that wait at once, and the BYE's transaction with it. A caller that
+// wants the answer waited for passes a ctx that outlives the dialog.
 func (s *DialogClientSession) WriteBye(ctx context.Context, bye *sip.Request) error {
 	defer s.Close()
 
@@ -794,8 +801,11 @@ func (s *DialogClientSession) WriteBye(ctx context.Context, bye *sip.Request) er
 		return err
 	}
 	defer s.inviteTx.Terminate() // Terminates INVITE in all cases
-	ctx, cancel := s.endOnBye(ctx)
-	defer cancel()
+	// RFC 3261 section 15.1.1: "The UAC MUST consider the session terminated
+	// (and therefore stop sending or listening for media) as soon as the BYE
+	// request is passed to the client transaction." A request the peer sends
+	// meanwhile, such as a re-INVITE, finds the dialog ended.
+	s.setState(sip.DialogStateEnded)
 
 	answer, err := s.finalAnswer(ctx, s.UA.Client, bye, tx)
 	if err != nil {

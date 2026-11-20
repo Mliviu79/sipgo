@@ -452,6 +452,8 @@ func (s *DialogServerSession) ackTimedOut() error {
 	return ErrDialogAckTimeout
 }
 
+// Bye sends a BYE to the Contact of the INVITE, see WriteBye. ctx bounds the
+// wait for the ACK and for the BYE's answer, as WriteBye describes.
 func (s *DialogServerSession) Bye(ctx context.Context) error {
 	req := s.Dialog.InviteRequest
 	cont := s.Dialog.InviteRequest.Contact()
@@ -467,6 +469,12 @@ func (s *DialogServerSession) Bye(ctx context.Context) error {
 // dialog's credentials answer is answered once, as Do does. The dialog ends as
 // soon as bye is passed to its client transaction (RFC 3261 section 15.1.1),
 // whatever the answer.
+//
+// ctx bounds the wait for the ACK and for the answer, and is used as given.
+// Ending the dialog ends its context, so a ctx that is, or derives from, the
+// dialog's context ends the wait for the answer at once, and the BYE's
+// transaction with it. A caller that wants the answer waited for passes a ctx
+// that outlives the dialog.
 func (s *DialogServerSession) WriteBye(ctx context.Context, bye *sip.Request) error {
 	state := s.state.Load()
 	// In case dialog terminated
@@ -515,8 +523,11 @@ func (s *DialogServerSession) WriteBye(ctx context.Context, bye *sip.Request) er
 	if err != nil {
 		return err
 	}
-	ctx, cancel := s.endOnBye(ctx)
-	defer cancel()
+	// RFC 3261 section 15.1.1: "The UAC MUST consider the session terminated
+	// (and therefore stop sending or listening for media) as soon as the BYE
+	// request is passed to the client transaction." A request the peer sends
+	// meanwhile, such as a re-INVITE, finds the dialog ended.
+	s.setState(sip.DialogStateEnded)
 
 	answer, err := s.finalAnswer(ctx, s.ua.Client, bye, tx)
 	if err != nil {

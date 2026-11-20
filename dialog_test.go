@@ -301,19 +301,16 @@ func (b *byeInFlight) respond(req *sip.Request, w *siptest.ClientTxResponder) {
 	w.Receive(res)
 }
 
-// TestDialogByeEndsSessionWhenSent sends our BYE, on each side, and holds its
-// 200. RFC 3261 section 15.1.1 has the session over as soon as the BYE is
-// passed to its client transaction, so a request the peer sends meanwhile,
-// such as a re-INVITE, must find the dialog ended: its state is Ended and its
-// context done while the BYE is in flight. Bye still waits for the 200, also
-// on a context derived from the dialog's, which ends with the dialog.
-func TestDialogByeEndsSessionWhenSent(t *testing.T) {
-	sides := []struct {
-		name string
-		// newConfirmed returns a confirmed dialog whose requests b answers,
-		// and its Bye.
-		newConfirmed func(t *testing.T, b *byeInFlight) (*Dialog, func(context.Context) error)
-	}{
+// byeSide is a confirmed dialog of one side, built by newConfirmed over a
+// peer that b answers, with its Bye.
+type byeSide struct {
+	name         string
+	newConfirmed func(t *testing.T, b *byeInFlight) (*Dialog, func(context.Context) error)
+}
+
+// byeSides returns the UAS and the UAC side for the BYE tests.
+func byeSides() []byeSide {
+	return []byeSide{
 		{
 			name: "UAS",
 			newConfirmed: func(t *testing.T, b *byeInFlight) (*Dialog, func(context.Context) error) {
@@ -348,45 +345,83 @@ func TestDialogByeEndsSessionWhenSent(t *testing.T) {
 			},
 		},
 	}
+}
+
+// TestDialogByeEndsSessionWhenSent sends our BYE, on each side, and holds its
+// 200. RFC 3261 section 15.1.1 has the session over as soon as the BYE is
+// passed to its client transaction, so a request the peer sends meanwhile,
+// such as a re-INVITE, must find the dialog ended: its state is Ended and its
+// context done while the BYE is in flight. Bye waits for the 200 within the
+// ctx it is given, which outlives the dialog.
+func TestDialogByeEndsSessionWhenSent(t *testing.T) {
+	sides := byeSides()
 
 	for _, side := range sides {
 		t.Run(side.name, func(t *testing.T) {
-			for _, ctxName := range []string{"OwnContext", "DialogContext"} {
-				t.Run(ctxName, func(t *testing.T) {
-					b := newByeInFlight()
-					d, bye := side.newConfirmed(t, b)
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					if ctxName == "DialogContext" {
-						ctx, cancel = context.WithTimeout(d.Context(), 5*time.Second)
-					}
-					defer cancel()
+			b := newByeInFlight()
+			d, bye := side.newConfirmed(t, b)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
-					sent := make(chan error, 1)
-					go func() { sent <- bye(ctx) }()
-					select {
-					case <-b.inFlight:
-					case <-time.After(5 * time.Second):
-						t.Fatal("the BYE was not sent")
-					}
-					// The BYE reaches the peer as the transaction takes it,
-					// and the dialog ends once the transaction has.
-					select {
-					case <-d.Context().Done():
-					case <-time.After(5 * time.Second):
-						t.Fatal("the session goes on while the BYE is in flight")
-					}
-					assert.Equal(t, sip.DialogStateEnded, d.LoadState())
-
-					close(b.release)
-					select {
-					case err := <-sent:
-						require.NoError(t, err)
-					case <-time.After(5 * time.Second):
-						t.Fatal("Bye did not return after the 200")
-					}
-					assert.Equal(t, sip.DialogStateEnded, d.LoadState())
-				})
+			sent := make(chan error, 1)
+			go func() { sent <- bye(ctx) }()
+			select {
+			case <-b.inFlight:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the BYE was not sent")
 			}
+			// The BYE reaches the peer as the transaction takes it, and the
+			// dialog ends once the transaction has.
+			select {
+			case <-d.Context().Done():
+			case <-time.After(5 * time.Second):
+				t.Fatal("the session goes on while the BYE is in flight")
+			}
+			assert.Equal(t, sip.DialogStateEnded, d.LoadState())
+			// The end of the dialog does not end ctx, so the wait for the
+			// 200 goes on: a Bye that stopped waiting before the 200 would
+			// return no 200, and so an error.
+			close(b.release)
+			select {
+			case err := <-sent:
+				require.NoError(t, err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("Bye did not return after the 200")
+			}
+			assert.Equal(t, sip.DialogStateEnded, d.LoadState())
+		})
+	}
+}
+
+// TestDialogByeOnDialogContextEndsWaitAtOnce sends our BYE, on each side, on a
+// ctx derived from the dialog's context and holds its 200. The BYE ends the
+// dialog as it is sent, and with it that ctx: the wait for the answer ends at
+// once with the ctx's error, and the BYE is still sent.
+func TestDialogByeOnDialogContextEndsWaitAtOnce(t *testing.T) {
+	sides := byeSides()
+
+	for _, side := range sides {
+		t.Run(side.name, func(t *testing.T) {
+			b := newByeInFlight()
+			defer close(b.release)
+			d, bye := side.newConfirmed(t, b)
+			ctx, cancel := context.WithTimeout(d.Context(), 5*time.Second)
+			defer cancel()
+
+			sent := make(chan error, 1)
+			go func() { sent <- bye(ctx) }()
+			select {
+			case <-b.inFlight:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the BYE was not sent")
+			}
+			select {
+			case err := <-sent:
+				require.ErrorIs(t, err, context.Canceled)
+			case <-time.After(5 * time.Second):
+				t.Fatal("Bye went on waiting after the dialog, and its ctx, ended")
+			}
+			assert.Equal(t, sip.DialogStateEnded, d.LoadState())
 		})
 	}
 }
