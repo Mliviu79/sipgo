@@ -29,6 +29,7 @@ var compactHeaderForms = []struct {
 	{compact: "t", full: "To"},
 	{compact: "u", full: "Allow-Events"},
 	{compact: "v", full: "Via"},
+	{compact: "x", full: "Session-Expires"},
 }
 
 func TestCompactHeaderNameRoundTrip(t *testing.T) {
@@ -57,6 +58,7 @@ const compactReferRequest = "REFER sip:bob@example.com SIP/2.0\r\n" +
 	"s: transfer\r\n" +
 	"e: identity\r\n" +
 	"u: refer\r\n" +
+	"x: 1800;refresher=uas\r\n" +
 	"c: text/plain\r\n" +
 	"l: 0\r\n" +
 	"\r\n"
@@ -89,6 +91,10 @@ func TestParseCompactHeaderLookups(t *testing.T) {
 		referredBy := req.ReferredBy()
 		require.NotNil(t, referredBy)
 		assert.Equal(t, "alice", referredBy.Address.User)
+
+		sessionExpires := req.SessionExpires()
+		require.NotNil(t, sessionExpires)
+		assert.Equal(t, uint32(1800), sessionExpires.Delta)
 	})
 
 	for _, form := range compactHeaderForms {
@@ -103,11 +109,12 @@ func TestParseCompactHeaderLookups(t *testing.T) {
 
 	t.Run("NamesKeptOnTheWire", func(t *testing.T) {
 		out := req.String()
-		for _, line := range []string{"r: <sip:carol@example.com>\r\n", "b: <sip:alice@example.com>\r\n", "o: refer\r\n", "u: refer\r\n"} {
+		for _, line := range []string{"r: <sip:carol@example.com>\r\n", "b: <sip:alice@example.com>\r\n", "o: refer\r\n", "u: refer\r\n", "x: 1800;refresher=uas\r\n"} {
 			assert.Contains(t, out, line)
 		}
 		assert.NotContains(t, out, "Refer-To")
 		assert.NotContains(t, out, "Referred-By")
+		assert.NotContains(t, out, "Session-Expires")
 	})
 }
 
@@ -122,6 +129,7 @@ func TestFullHeaderFoundByCompactName(t *testing.T) {
 		"Allow-Events: refer\r\n" +
 		"Refer-To: <sip:carol@example.com>\r\n" +
 		"Referred-By: <sip:bob@example.com>\r\n" +
+		"Session-Expires: 1800;refresher=uac\r\n" +
 		"Content-Length: 0\r\n" +
 		"\r\n"
 	msg, err := ParseMessage([]byte(raw))
@@ -129,7 +137,7 @@ func TestFullHeaderFoundByCompactName(t *testing.T) {
 	req, ok := msg.(*Request)
 	require.True(t, ok)
 
-	for _, name := range []string{"o", "O", "u", "r", "b", "v", "f", "t", "i", "l"} {
+	for _, name := range []string{"o", "O", "u", "r", "b", "v", "f", "t", "i", "l", "x", "X"} {
 		assert.NotNil(t, req.GetHeader(name), "GetHeader(%q)", name)
 		assert.Len(t, req.GetHeaders(name), 1, "GetHeaders(%q)", name)
 	}
@@ -161,11 +169,21 @@ func TestFullHeaderNameEditsStayCaseSensitive(t *testing.T) {
 	hs := new(headers)
 	hs.AppendHeader(NewHeader("Event", "refer"))
 
-	hs.AppendHeader(NewHeader("x", "90"))
+	// z is no registered compact form, so it is a plain one-letter name.
+	hs.AppendHeader(NewHeader("z", "90"))
 
 	assert.False(t, hs.RemoveHeader("event"))
-	assert.False(t, hs.RemoveHeader("X"))
+	assert.False(t, hs.RemoveHeader("Z"))
 	assert.NotNil(t, hs.GetHeader("event"))
 	assert.True(t, hs.RemoveHeader("o"))
 	assert.Nil(t, hs.GetHeader("Event"))
+}
+
+func TestCompactSerialisationWritesSessionExpiresAsX(t *testing.T) {
+	hs := new(headers)
+	hs.CompactHeaders = true
+	hs.AppendHeader(NewHeader("Session-Expires", "1800;refresher=uac"))
+	hs.AppendHeader(NewHeader("Min-SE", "90"))
+
+	assert.Equal(t, "x: 1800;refresher=uac\r\nMin-SE: 90\r\n", hs.String())
 }

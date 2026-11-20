@@ -447,7 +447,7 @@ func (hs *headers) ReferredBy() *ReferredByHeader {
 // refresh loop instead of failing.
 func (hs *headers) SessionExpires() *SessionExpiresHeader {
 	h := &SessionExpiresHeader{}
-	if parseHeaderLazy(hs, parseSessionExpiresHeader, []string{"session-expires", "x"}, h) {
+	if parseHeaderLazy(hs, parseSessionExpiresHeader, []string{"session-expires"}, h) {
 		return h
 	}
 	return nil
@@ -1349,6 +1349,8 @@ func headerNameKey(name string) string {
 		return "subject"
 	case "u":
 		return "allow-events"
+	case "x":
+		return "session-expires"
 	default:
 		return lower
 	}
@@ -1402,6 +1404,9 @@ func compactHeaderName(full string) string {
 		return "s"
 	case "Allow-Events":
 		return "u"
+	case "Session-Expires":
+		// RFC 4028 section 4 reserves x as the compact form.
+		return "x"
 
 	default:
 		return full
