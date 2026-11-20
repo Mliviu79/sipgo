@@ -242,7 +242,10 @@ func (txl *TransactionLayer) handleMessage(msg Message) {
 	case *Request:
 		go txl.handleRequestBackground(msg)
 	case *Response:
-		go txl.handleResponseBackground(msg)
+		// Matched on the read loop, so the responses of one client
+		// transaction keep the order they arrived in; handleResponse does
+		// not wait for a TU.
+		txl.handleResponseBackground(msg)
 	default:
 		txl.log.Error("unsupported message, skip it")
 	}
@@ -535,11 +538,13 @@ func (txl *TransactionLayer) handleResponse(res *Response) error {
 	if !exists {
 		// RFC 3261 - 17.1.1.2.
 		// Not matched responses should be passed directly to the UA
-		txl.unRespHandler(res)
+		go txl.unRespHandler(res)
 		return nil
 	}
 
-	tx.Receive(res)
+	// RFC 3261 section 17.1.1.2: every provisional response is passed up to
+	// the TU, so none may overtake another or the 2xx behind it.
+	tx.receiveInOrder(res)
 	return nil
 }
 

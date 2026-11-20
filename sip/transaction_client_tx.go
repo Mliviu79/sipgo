@@ -3,6 +3,8 @@ package sip
 import (
 	"fmt"
 	"log/slog"
+	"slices"
+	"sync"
 	"time"
 )
 
@@ -17,6 +19,13 @@ type ClientTx struct {
 	timer_m      *time.Timer
 
 	onRetransmission FnTxResponse
+
+	// inbox holds the responses the transport handed over that Receive has
+	// not taken yet, in the order they were received; draining is set while
+	// a goroutine takes them. inboxMu guards both.
+	inboxMu  sync.Mutex
+	inbox    []*Response
+	draining bool
 }
 
 func NewClientTx(key string, origin *Request, conn Connection, logger *slog.Logger) *ClientTx {
@@ -157,6 +166,42 @@ func (tx *ClientTx) Receive(res *Response) {
 	// }
 
 	tx.spinFsmWithResponse(input, res)
+}
+
+// receiveInOrder queues res behind the responses received before it and
+// returns without waiting. Receive blocks until the TU reads the response,
+// so the transport's read loop must not call it; a goroutine per response
+// would race for the FSM and could hand a later response over first, after
+// which an earlier provisional finds the transaction past Proceeding and is
+// dropped. One goroutine takes the queue in order instead, and each Receive
+// it makes ends once the TU reads or the transaction ends.
+func (tx *ClientTx) receiveInOrder(res *Response) {
+	tx.inboxMu.Lock()
+	tx.inbox = append(tx.inbox, res)
+	if tx.draining {
+		tx.inboxMu.Unlock()
+		return
+	}
+	tx.draining = true
+	tx.inboxMu.Unlock()
+	go tx.drainInbox()
+}
+
+// drainInbox passes the queued responses to Receive in order, and returns
+// once the queue is empty.
+func (tx *ClientTx) drainInbox() {
+	for {
+		tx.inboxMu.Lock()
+		if len(tx.inbox) == 0 {
+			tx.draining = false
+			tx.inboxMu.Unlock()
+			return
+		}
+		res := tx.inbox[0]
+		tx.inbox = slices.Delete(tx.inbox, 0, 1)
+		tx.inboxMu.Unlock()
+		tx.Receive(res)
+	}
 }
 
 func (tx *ClientTx) Connection() Connection {
